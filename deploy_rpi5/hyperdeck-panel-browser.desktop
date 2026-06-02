@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=HyperDeck Panel Browser
+Comment=Open HyperDeck Control Panel after desktop login
+Exec=sh -c 'sleep 10; /usr/bin/chromium --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --new-window http://127.0.0.1:8080/'
+Terminal=false
+X-GNOME-Autostart-enabled=true

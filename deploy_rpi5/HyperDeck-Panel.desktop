@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=HyperDeck Panel
+Comment=Open HyperDeck Control Panel
+Exec=sh -c '/usr/bin/chromium --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --new-window http://127.0.0.1:8080/'
+Terminal=false
