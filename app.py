@@ -15,14 +15,12 @@ import re
 HOST = "0.0.0.0"
 PORT = 8080
 CONFIG_FILE = Path("config.json")
-SIM_STATES = {}
 
 DEFAULT_CONFIG = {
     "panel_ip": "10.0.0.8",
     "atem_logger_ip": "10.0.0.9",
     "expected_format": "1080p50",
     "tc_reference_mode": "group",
-    "simulation": True,
     "tc_compare": True,
     "tc_tolerance_frames": 2,
     "decks": [
@@ -169,16 +167,11 @@ def ensure_status_pollers(cfg):
     if STATUS_POLLERS_PAUSED:
         return
     decks = cfg.get("decks", [])
-    simulation = cfg.get("simulation", False)
-
-    if simulation:
-        desired = {}
-    else:
-        desired = {
-            i: deck.get("ip", "").strip()
-            for i, deck in enumerate(decks)
-            if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip()
-        }
+    desired = {
+        i: deck.get("ip", "").strip()
+        for i, deck in enumerate(decks)
+        if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip()
+    }
 
     with STATUS_LOCK:
         existing = list(STATUS_POLLERS.items())
@@ -229,15 +222,7 @@ def ensure_status_pollers(cfg):
 
 def get_status_map(cfg):
     decks = cfg.get("decks", [])
-    simulation = cfg.get("simulation", False)
     result = {}
-
-    if simulation:
-        init_sim_states(len(decks))
-        return {
-            i: get_sim_state(i) if deck_is_armed_at_index(cfg, i, deck) else get_skipped_state()
-            for i, deck in enumerate(decks)
-        }
 
     if not decks:
         return result
@@ -471,7 +456,6 @@ def load_config():
     cfg.setdefault("atem_logger_ip", "10.0.0.9")
     cfg.setdefault("expected_format", "1080p50")
     cfg.setdefault("tc_reference_mode", "group")
-    cfg.setdefault("simulation", True)
     cfg.setdefault("tc_compare", True)
     cfg.setdefault("tc_tolerance_frames", 2)
     cfg.setdefault("decks", copy.deepcopy(DEFAULT_CONFIG["decks"]))
@@ -517,6 +501,21 @@ def get_armed_deck_indexes(cfg):
     ]
 
 
+def get_active_count_text(cfg):
+    decks = cfg.get("decks", [])
+    active_cameras = 0
+
+    for index, deck in enumerate(decks):
+        if is_control_room_deck(cfg, index):
+            continue
+
+        if deck_is_armed_at_index(cfg, index, deck):
+            active_cameras += 1
+
+    control_room_count = 1 if decks else 0
+    return f"{active_cameras}+{control_room_count}"
+
+
 def frames_to_tcx2(total_frames, fps=25):
     total_frames %= 24 * 60 * 60 * fps
 
@@ -530,74 +529,6 @@ def frames_to_tcx2(total_frames, fps=25):
     ff = (total_frames % fps) * 2
 
     return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
-
-
-def init_sim_states(deck_count):
-    defaults = [
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "TC WARNING", "led": "warning", "tc_valid": True, "offset": 5},
-        {"status": "OFFLINE", "led": "offline", "tc_valid": False, "offset": 0},
-        {"status": "NO SIGNAL", "led": "warning", "tc_valid": False, "offset": 0},
-        {"status": "STOPPED", "led": "stopped", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-    ]
-
-    for i in range(deck_count):
-        if i not in SIM_STATES:
-            if i < len(defaults):
-                SIM_STATES[i] = defaults[i].copy()
-            else:
-                SIM_STATES[i] = {
-                    "status": "STOPPED",
-                    "led": "stopped",
-                    "tc_valid": True,
-                    "offset": 0
-                }
-
-    for key in list(SIM_STATES.keys()):
-        if key >= deck_count:
-            del SIM_STATES[key]
-
-
-def set_sim_deck_status(index, cmd):
-    if index not in SIM_STATES:
-        return
-
-    if cmd == "rec":
-        SIM_STATES[index] = {
-            "status": "RECORDING",
-            "led": "recording",
-            "tc_valid": True,
-            "offset": 0
-        }
-
-    elif cmd == "stop":
-        SIM_STATES[index] = {
-            "status": "STOPPED",
-            "led": "stopped",
-            "tc_valid": True,
-            "offset": 0
-        }
-
-
-def get_sim_state(index):
-    state = SIM_STATES.get(index, {
-        "status": "STOPPED",
-        "led": "stopped",
-        "tc_valid": True,
-        "offset": 0
-    })
-
-    if not state.get("tc_valid", False):
-        return state["status"], state["led"], "---", "--:--:--:--", False, 0
-
-    total_frames = int(time.time() * 25) + int(state.get("offset", 0))
-    tc = frames_to_tcx2(total_frames)
-
-    return state["status"], state["led"], "---", tc, True, total_frames
 
 
 def recv_hyperdeck_message(sock, timeout=0.6):
@@ -906,19 +837,20 @@ def make_tc_input_select(index, current_value="---"):
     )
 
 
-def make_alarm(cfg):
+def make_alarm(cfg, status_map=None):
     if not cfg.get("tc_compare", True):
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">TC COMPARE OFF</div>'
+        return '<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">TC COMPARE OFF</div>'
 
-    status_map = get_status_map(cfg)
+    if status_map is None:
+        status_map = get_status_map(cfg)
+
     tc_compare = build_tc_compare(cfg, status_map)
 
     if tc_compare.get("reference_invalid", False):
         return '<div id="tcAlarm" class="alarm" style="display:block;">TC REFERENCE INVALID – Režie nemá platný TC</div>'
 
     if not tc_compare["reference"]:
-        mode = "SIMULATION MODE" if cfg.get("simulation", False) else "REAL MODE"
-        return f'<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">{mode} – není co porovnávat</div>'
+        return '<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">REAL MODE – není co porovnávat</div>'
 
     if tc_compare["bad"]:
         parts = []
@@ -945,23 +877,18 @@ def make_alarm(cfg):
             f'</div>'
         )
 
-    mode = "SIMULATION MODE" if cfg.get("simulation", False) else "REAL MODE"
     tolerance = tc_compare["tolerance"]
 
     return (
-        f'<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">'
-        f'{mode} – TC OK | tolerance {tolerance}f'
+        f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">'
+        f'REAL MODE – TC OK | tolerance {tolerance}f'
         f'</div>'
     )
 
 
 def make_rows(cfg):
     rows = ""
-    simulation = cfg.get("simulation", False)
     expected_format = cfg.get("expected_format", "1080p50")
-
-    if simulation:
-        init_sim_states(len(cfg["decks"]))
 
     status_map = get_status_map(cfg)
     tc_compare = build_tc_compare(cfg, status_map)
@@ -1083,6 +1010,7 @@ body{margin:0;background:#09090d;color:#eee;font-family:Arial,sans-serif;overflo
 .wrap{width:100vw;min-height:100vh;padding:12px 18px 40px}
 .header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:10px}
 h1{margin:0;font-size:30px;letter-spacing:2px;white-space:nowrap}
+.active-count{flex:1;text-align:center;font-family:monospace;font-size:26px;font-weight:bold;color:#78ff9c;white-space:nowrap}
 .topnav{display:flex;justify-content:center;gap:12px}
 .navbtn{border:1px solid #444;border-radius:10px;padding:10px 22px;background:#242432;color:#eee;font-size:18px;font-weight:bold;cursor:pointer}
 .navbtn.active{background:#1b6cff;border-color:#7dabff;box-shadow:0 0 14px #1b6cff}
@@ -1110,7 +1038,7 @@ h1{margin:0;font-size:30px;letter-spacing:2px;white-space:nowrap}
   transform:translateY(-8px);
 }
 .alarm{display:none;margin-bottom:10px;padding:10px;border-radius:10px;background:#7a0000;color:#fff;text-align:center;font-size:24px;font-weight:bold;box-shadow:0 0 18px #f33}
-.simulation-ok{background:#113b20;color:#78ff9c;box-shadow:0 0 14px #008d35}
+.alarm-ok{background:#113b20;color:#78ff9c;box-shadow:0 0 14px #008d35}
 .view{display:none}
 .view.active{display:block}
 .panel-card{background:#15151d;border:1px solid #33333d;border-radius:12px;overflow:hidden}
@@ -1316,6 +1244,7 @@ body.initial-settings .settings-panel {
 <div class="wrap">
   <div class="header">
     <h1>HYPERDECK CONTROL</h1>
+    <div class="active-count">__ACTIVE_COUNT__</div>
     <div class="topnav">
       <button id="btnDecks" class="navbtn active" onclick="window.location.href='/'">HYPERDECK</button>
       <button id="btnLogger" class="navbtn" onclick="window.location.href='/atem'">ATEM LOGGER</button>
@@ -1382,11 +1311,6 @@ body.initial-settings .settings-panel {
       </select>
 
       <div class="settings-switch-row">
-        <label class="check-label">
-          <input type="checkbox" name="simulation" value="1" __SIMULATION_CHECKED__>
-          SIMULATION MODE
-        </label>
-
         <label class="check-label">
           <input type="checkbox" name="tc_compare" value="1" __TC_COMPARE_CHECKED__>
           TC COMPARE
@@ -1634,7 +1558,7 @@ function startStatusPolling() {
   }
 
   pollStatus();
-  pollStatusTimer = setInterval(pollStatus, 1000);
+  pollStatusTimer = setInterval(pollStatus, 500);
 }
 
 function stopStatusPolling() {
@@ -1719,7 +1643,6 @@ setTimeout(() => {
 
 def build_status_api():
     cfg = load_config()
-    simulation = cfg.get("simulation", False)
     expected_format = cfg.get("expected_format", "1080p50")
     decks_out = []
     status_map = get_status_map(cfg)
@@ -1752,8 +1675,7 @@ def build_status_api():
         })
 
     return {
-        "simulation": simulation,
-        "alarm_html": make_alarm(cfg),
+        "alarm_html": make_alarm(cfg, status_map=status_map),
         "decks": decks_out
     }
 
@@ -1847,13 +1769,12 @@ def build_page(saved=False, initial_view="hyperdeck"):
     if saved:
         notice = '<div class="notice">Nastavení uloženo.</div>'
 
-    simulation_checked = "checked" if cfg.get("simulation", False) else ""
     tc_compare_checked = "checked" if cfg.get("tc_compare", True) else ""
     tc_tolerance_frames = html.escape(str(cfg.get("tc_tolerance_frames", 2)))
     tc_reference_mode = normalize_tc_reference_mode(cfg.get("tc_reference_mode", "group"))
     tc_ref_group_selected = "selected" if tc_reference_mode == "group" else ""
     tc_ref_control_room_selected = "selected" if tc_reference_mode == "control_room" else ""
-    status_poll_enabled = "false" if cfg.get("simulation", False) else "true"
+    status_poll_enabled = "true"
 
     page = HTML_TEMPLATE
 
@@ -1872,6 +1793,7 @@ def build_page(saved=False, initial_view="hyperdeck"):
     # initial settings body class end
     page = page.replace("__NOTICE__", notice)
     page = page.replace("__ALARM__", make_alarm(cfg))
+    page = page.replace("__ACTIVE_COUNT__", html.escape(get_active_count_text(cfg)))
     if initial_view == "hyperdeck":
         page = page.replace("__ROWS__", make_rows(cfg))
     else:
@@ -1882,7 +1804,6 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__EXPECTED_FORMAT__", expected_format)
     page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
-    page = page.replace("__SIMULATION_CHECKED__", simulation_checked)
     page = page.replace("__TC_COMPARE_CHECKED__", tc_compare_checked)
     page = page.replace("__TC_TOLERANCE_FRAMES__", tc_tolerance_frames)
     page = page.replace("__STATUS_POLL_ENABLED__", status_poll_enabled)
@@ -1948,43 +1869,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/action":
             cfg = load_config()
-            simulation = cfg.get("simulation", False)
             cmd = form.get("cmd", [""])[0]
 
-            if simulation:
-                init_sim_states(len(cfg["decks"]))
+            if cmd == "rec_all":
+                send_hyperdeck_commands_parallel(get_armed_decks(cfg), "rec")
 
-                if cmd == "rec_all":
-                    for i in get_armed_deck_indexes(cfg):
-                        set_sim_deck_status(i, "rec")
+            elif cmd == "stop_all":
+                send_hyperdeck_commands_parallel(get_armed_decks(cfg), "stop")
 
-                elif cmd == "stop_all":
-                    for i in get_armed_deck_indexes(cfg):
-                        set_sim_deck_status(i, "stop")
+            elif cmd in ("rec", "stop"):
+                try:
+                    deck_index = int(form.get("deck", ["-1"])[0])
 
-                elif cmd in ("rec", "stop"):
-                    try:
-                        deck_index = int(form.get("deck", ["-1"])[0])
-                        set_sim_deck_status(deck_index, cmd)
-                    except ValueError:
-                        pass
+                    if 0 <= deck_index < len(cfg["decks"]):
+                        send_hyperdeck_command(cfg["decks"][deck_index], cmd)
 
-            else:
-                if cmd == "rec_all":
-                    send_hyperdeck_commands_parallel(get_armed_decks(cfg), "rec")
-
-                elif cmd == "stop_all":
-                    send_hyperdeck_commands_parallel(get_armed_decks(cfg), "stop")
-
-                elif cmd in ("rec", "stop"):
-                    try:
-                        deck_index = int(form.get("deck", ["-1"])[0])
-
-                        if 0 <= deck_index < len(cfg["decks"]):
-                            send_hyperdeck_command(cfg["decks"][deck_index], cmd)
-
-                    except ValueError:
-                        pass
+                except ValueError:
+                    pass
 
             self.send_response(303)
             self.send_header("Location", "/")
@@ -2028,7 +1929,6 @@ class Handler(BaseHTTPRequestHandler):
 
             cfg["tc_reference_mode"] = normalize_tc_reference_mode(tc_reference_mode)
 
-            cfg["simulation"] = "simulation" in form
             cfg["tc_compare"] = "tc_compare" in form
 
             try:
