@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+
+# Local development backups - keep on Raspberry, do not track in Git
+app_*.py
+config_*.json
+app_broken*.py
+api_status_*.log
