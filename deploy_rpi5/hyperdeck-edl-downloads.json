@@ -1,0 +1,19 @@
+{
+  "ExemptDomainFileTypePairsFromFileTypeDownloadWarnings": [
+    {
+      "file_extension": "edl",
+      "domains": ["*"]
+    }
+  ],
+  "SafeBrowsingAllowlistDomains": [
+    "10.0.0.8",
+    "10.0.0.9",
+    "127.0.0.1"
+  ],
+  "InsecureContentAllowedForUrls": [
+    "http://10.0.0.8/*",
+    "http://10.0.0.9/*",
+    "http://10.0.0.9/files/*",
+    "http://127.0.0.1:8080/*"
+  ]
+}

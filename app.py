@@ -9,12 +9,14 @@ import threading
 import copy
 import os
 import ipaddress
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
 HOST = "0.0.0.0"
 PORT = 8080
 CONFIG_FILE = Path("config.json")
+PANEL_BROWSER_URL = f"http://127.0.0.1:{PORT}/"
 
 DEFAULT_CONFIG = {
     "panel_ip": "10.0.0.8",
@@ -97,6 +99,42 @@ def get_offline_state():
     return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0)
 
 
+def make_status_cache_entry(state):
+    return {
+        "state": state,
+        "updated_monotonic": time.monotonic()
+    }
+
+
+def normalize_state_to_snapshot(state, updated_monotonic, snapshot_monotonic):
+    status_text, led_class, format_text, tc, tc_valid, total_frames = state
+
+    if not tc_valid:
+        return state
+
+    elapsed_seconds = max(0.0, snapshot_monotonic - updated_monotonic)
+    elapsed_frames = int(elapsed_seconds * 25)
+    normalized_frames = int(total_frames) + elapsed_frames
+
+    return (
+        status_text,
+        led_class,
+        format_text,
+        frames_to_tcx2(normalized_frames),
+        tc_valid,
+        normalized_frames
+    )
+
+
+def read_status_cache_entry(entry, snapshot_monotonic):
+    if isinstance(entry, dict):
+        state = entry.get("state", get_offline_state())
+        updated_monotonic = entry.get("updated_monotonic", snapshot_monotonic)
+        return normalize_state_to_snapshot(state, updated_monotonic, snapshot_monotonic)
+
+    return entry
+
+
 def status_poller_loop(index, ip, stop_event):
     sock = None
     fail_count = 0
@@ -132,7 +170,7 @@ def status_poller_loop(index, ip, stop_event):
             fail_count = 0
 
             with STATUS_LOCK:
-                STATUS_CACHE[index] = state
+                STATUS_CACHE[index] = make_status_cache_entry(state)
 
             stop_event.wait(STATUS_POLL_INTERVAL)
 
@@ -146,7 +184,7 @@ def status_poller_loop(index, ip, stop_event):
                 fail_count = 0
 
                 with STATUS_LOCK:
-                    STATUS_CACHE[index] = state
+                    STATUS_CACHE[index] = make_status_cache_entry(state)
 
             except Exception:
                 close_sock()
@@ -156,7 +194,7 @@ def status_poller_loop(index, ip, stop_event):
                 # OFFLINE ukážeme až po dvou selháních za sebou.
                 if fail_count >= 2:
                     with STATUS_LOCK:
-                        STATUS_CACHE[index] = get_offline_state()
+                        STATUS_CACHE[index] = make_status_cache_entry(get_offline_state())
 
             stop_event.wait(STATUS_POLL_INTERVAL)
 
@@ -186,13 +224,13 @@ def ensure_status_pollers(cfg):
 
             with STATUS_LOCK:
                 STATUS_POLLERS.pop(index, None)
-                STATUS_CACHE[index] = get_skipped_state()
+                STATUS_CACHE[index] = make_status_cache_entry(get_skipped_state())
 
     # Nastavit skipped pro neaktivní rekordéry.
     with STATUS_LOCK:
         for i in range(len(decks)):
             if i not in desired and i not in STATUS_POLLERS:
-                STATUS_CACHE[i] = get_skipped_state()
+                STATUS_CACHE[i] = make_status_cache_entry(get_skipped_state())
 
     # Spustit nové pollery.
     for index, ip in desired.items():
@@ -210,7 +248,7 @@ def ensure_status_pollers(cfg):
         )
 
         with STATUS_LOCK:
-            STATUS_CACHE[index] = get_offline_state()
+            STATUS_CACHE[index] = make_status_cache_entry(get_offline_state())
             STATUS_POLLERS[index] = {
                 "ip": ip,
                 "stop": stop_event,
@@ -228,13 +266,15 @@ def get_status_map(cfg):
         return result
 
     ensure_status_pollers(cfg)
+    snapshot_monotonic = time.monotonic()
 
     with STATUS_LOCK:
         cached = STATUS_CACHE.copy()
 
     for i, deck in enumerate(decks):
         if deck_is_armed_at_index(cfg, i, deck):
-            result[i] = cached.get(i, get_offline_state())
+            entry = cached.get(i, make_status_cache_entry(get_offline_state()))
+            result[i] = read_status_cache_entry(entry, snapshot_monotonic)
         else:
             result[i] = get_skipped_state()
 
@@ -1011,9 +1051,11 @@ body{margin:0;background:#09090d;color:#eee;font-family:Arial,sans-serif;overflo
 .header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:10px}
 h1{margin:0;font-size:30px;letter-spacing:2px;white-space:nowrap}
 .active-count{flex:1;text-align:center;font-family:monospace;font-size:26px;font-weight:bold;color:#78ff9c;white-space:nowrap}
-.topnav{display:flex;justify-content:center;gap:12px}
+.topnav{display:flex;justify-content:center;align-items:center;gap:12px}
 .navbtn{border:1px solid #444;border-radius:10px;padding:10px 22px;background:#242432;color:#eee;font-size:18px;font-weight:bold;cursor:pointer}
 .navbtn.active{background:#1b6cff;border-color:#7dabff;box-shadow:0 0 14px #1b6cff}
+.close-panel-btn{width:44px;height:44px;min-width:44px;padding:0;border:1px solid #5d2222;border-radius:4px;background:#3a1515;color:#fff;font-size:26px;font-weight:bold;line-height:1;cursor:pointer}
+.close-panel-btn:hover{background:#7a0000;border-color:#ff6666;box-shadow:0 0 12px rgba(255,75,75,.55)}
 .notice{
   position:fixed !important;
   top:14px !important;
@@ -1249,6 +1291,7 @@ body.initial-settings .settings-panel {
       <button id="btnDecks" class="navbtn active" onclick="window.location.href='/'">HYPERDECK</button>
       <button id="btnLogger" class="navbtn" onclick="window.location.href='/atem'">ATEM LOGGER</button>
       <button id="btnSettings" class="navbtn" onclick="window.location.href='/settings'">SETTINGS</button>
+      <button class="close-panel-btn" type="button" title="Zavřít panel" onclick="closePanel()">×</button>
     </div>
   </div>
 
@@ -1354,6 +1397,17 @@ body.initial-settings .settings-panel {
 
 <script>
 
+async function closePanel() {
+  try {
+    await fetch("/api/close-panel", {
+      method: "POST",
+      cache: "no-store"
+    });
+  } catch (err) {
+    console.log("Close panel error:", err);
+  }
+}
+
 function addActive(id) {
   const el = document.getElementById(id);
   if (el) {
@@ -1432,8 +1486,10 @@ function formatTCx2From25Frames(totalFrames) {
 }
 
 function initLiveTC() {
+  const startMs = Date.now();
+
   document.querySelectorAll(".live-tc").forEach((el) => {
-    el.dataset.startMs = String(Date.now());
+    el.dataset.startMs = String(startMs);
     el.dataset.startFrame = el.dataset.baseFrame;
   });
 }
@@ -1458,6 +1514,8 @@ const STATUS_POLL_ENABLED = __STATUS_POLL_ENABLED__;
 let statusFetchBusy = false;
 
 function applyStatusData(data) {
+  const statusUpdateMs = Date.now();
+
   if (data.alarm_html) {
     const alarm = document.getElementById("tcAlarm");
     if (alarm) {
@@ -1498,7 +1556,7 @@ function applyStatusData(data) {
         tcCell.classList.toggle("tc-warning", !!deck.tc_warning);
         tcCell.dataset.baseFrame = String(deck.total_frames);
         tcCell.dataset.startFrame = String(deck.total_frames);
-        tcCell.dataset.startMs = String(Date.now());
+        tcCell.dataset.startMs = String(statusUpdateMs);
         tcCell.textContent = deck.tc;
       } else {
         tcCell.classList.remove("live-tc");
@@ -1680,6 +1738,42 @@ def build_status_api():
     }
 
 
+def close_panel_browser():
+    closed = 0
+    current_pid = os.getpid()
+
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+
+        pid = int(proc_dir.name)
+
+        if pid == current_pid:
+            continue
+
+        try:
+            comm = (proc_dir / "comm").read_text(encoding="utf-8").strip().lower()
+            cmdline_raw = (proc_dir / "cmdline").read_bytes()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        cmdline = cmdline_raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+
+        if "chromium" not in comm:
+            continue
+
+        if PANEL_BROWSER_URL not in cmdline:
+            continue
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            closed += 1
+        except OSError:
+            pass
+
+    return closed
+
+
 def add_initial_settings_class(match):
     tag = match.group(0)
 
@@ -1844,6 +1938,19 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = parse_qs(body)
+
+        if self.path == "/api/close-panel":
+            payload = json.dumps({
+                "closed": close_panel_browser()
+            }, ensure_ascii=False).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         if self.path == "/toggle-arm":
             cfg = load_config()
