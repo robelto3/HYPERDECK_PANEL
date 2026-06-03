@@ -9,3 +9,6 @@ app_*.py
 config_*.json
 app_broken*.py
 api_status_*.log
+
+# Local backup folders
+backup_*/
