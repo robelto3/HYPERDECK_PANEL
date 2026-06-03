@@ -1,6 +1,8 @@
 {
   "panel_ip": "10.0.0.8",
   "atem_logger_ip": "10.0.0.9",
+  "expected_format": "1080p50",
+  "tc_reference_mode": "control_room",
   "decks": [
     {
       "name": "Cam 1",
@@ -35,12 +37,22 @@
     {
       "name": "Cam 7",
       "ip": "10.0.0.21",
-      "armed": true
+      "armed": false
     },
     {
       "name": "Cam 8",
       "ip": "10.0.0.22",
-      "armed": true
+      "armed": false
+    },
+    {
+      "name": "Cam 9",
+      "ip": "10.0.0.23",
+      "armed": false
+    },
+    {
+      "name": "Cam 10",
+      "ip": "10.0.0.25",
+      "armed": false
     },
     {
       "name": "Režie",

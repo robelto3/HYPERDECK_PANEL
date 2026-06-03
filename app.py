@@ -6,6 +6,9 @@ import json
 import socket
 import time
 import threading
+import copy
+import os
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
@@ -17,403 +20,25 @@ SIM_STATES = {}
 DEFAULT_CONFIG = {
     "panel_ip": "10.0.0.8",
     "atem_logger_ip": "10.0.0.9",
+    "expected_format": "1080p50",
+    "tc_reference_mode": "group",
     "simulation": True,
     "tc_compare": True,
     "tc_tolerance_frames": 2,
     "decks": [
-        {"name": "REC 1", "ip": "10.0.0.11"},
-        {"name": "REC 2", "ip": "10.0.0.12"},
-        {"name": "REC 3", "ip": "10.0.0.13"},
-        {"name": "REC 4", "ip": "10.0.0.14"},
-        {"name": "REC 5", "ip": "10.0.0.15"},
-        {"name": "REC 6", "ip": "10.0.0.16"},
-        {"name": "REC 7", "ip": "10.0.0.21"},
-        {"name": "REC 8", "ip": "10.0.0.22"},
-        {"name": "PGM REC", "ip": "10.0.0.24"}
+        {"name": "Cam 1", "ip": "10.0.0.11"},
+        {"name": "Cam 2", "ip": "10.0.0.12"},
+        {"name": "Cam 3", "ip": "10.0.0.13"},
+        {"name": "Cam 4", "ip": "10.0.0.14"},
+        {"name": "Cam 5", "ip": "10.0.0.15"},
+        {"name": "Cam 6", "ip": "10.0.0.16"},
+        {"name": "Cam 7", "ip": "10.0.0.21"},
+        {"name": "Cam 8", "ip": "10.0.0.22"},
+        {"name": "Cam 9", "ip": ""},
+        {"name": "Cam 10", "ip": ""},
+        {"name": "Režie", "ip": "10.0.0.24"}
     ]
 }
-
-
-def save_config(cfg):
-    CONFIG_FILE.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-
-def load_config():
-    if not CONFIG_FILE.exists():
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
-
-    try:
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        cfg = DEFAULT_CONFIG.copy()
-
-    cfg.setdefault("panel_ip", "10.0.0.8")
-    cfg.setdefault("atem_logger_ip", "10.0.0.9")
-    cfg.setdefault("simulation", True)
-    cfg.setdefault("tc_compare", True)
-    cfg.setdefault("tc_tolerance_frames", 2)
-    cfg.setdefault("decks", DEFAULT_CONFIG["decks"])
-
-    for deck in cfg["decks"]:
-        deck.setdefault("armed", True)
-
-        if is_pgm_deck(deck.get("name", "")):
-            deck["armed"] = True
-
-    return cfg
-
-
-def is_pgm_deck(name):
-    return "PGM" in name.upper()
-
-
-def deck_is_armed(deck):
-    if is_pgm_deck(deck.get("name", "")):
-        return True
-
-    return bool(deck.get("armed", True))
-
-
-def get_armed_decks(cfg):
-    return [
-        deck
-        for deck in cfg.get("decks", [])
-        if deck_is_armed(deck)
-    ]
-
-
-def get_armed_deck_indexes(cfg):
-    return [
-        index
-        for index, deck in enumerate(cfg.get("decks", []))
-        if deck_is_armed(deck)
-    ]
-
-
-def frames_to_tcx2(total_frames, fps=25):
-    total_frames %= 24 * 60 * 60 * fps
-
-    hh = total_frames // (60 * 60 * fps)
-    total_frames %= 60 * 60 * fps
-
-    mm = total_frames // (60 * fps)
-    total_frames %= 60 * fps
-
-    ss = total_frames // fps
-    ff = (total_frames % fps) * 2
-
-    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
-
-
-def init_sim_states(deck_count):
-    defaults = [
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "TC WARNING", "led": "warning", "tc_valid": True, "offset": 5},
-        {"status": "OFFLINE", "led": "offline", "tc_valid": False, "offset": 0},
-        {"status": "NO SIGNAL", "led": "warning", "tc_valid": False, "offset": 0},
-        {"status": "STOPPED", "led": "stopped", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-        {"status": "RECORDING", "led": "recording", "tc_valid": True, "offset": 0},
-    ]
-
-    for i in range(deck_count):
-        if i not in SIM_STATES:
-            if i < len(defaults):
-                SIM_STATES[i] = defaults[i].copy()
-            else:
-                SIM_STATES[i] = {
-                    "status": "STOPPED",
-                    "led": "stopped",
-                    "tc_valid": True,
-                    "offset": 0
-                }
-
-    for key in list(SIM_STATES.keys()):
-        if key >= deck_count:
-            del SIM_STATES[key]
-
-
-def set_sim_deck_status(index, cmd):
-    if index not in SIM_STATES:
-        return
-
-    if cmd == "rec":
-        SIM_STATES[index] = {
-            "status": "RECORDING",
-            "led": "recording",
-            "tc_valid": True,
-            "offset": 0
-        }
-
-    elif cmd == "stop":
-        SIM_STATES[index] = {
-            "status": "STOPPED",
-            "led": "stopped",
-            "tc_valid": True,
-            "offset": 0
-        }
-
-
-def get_sim_state(index):
-    state = SIM_STATES.get(index, {
-        "status": "STOPPED",
-        "led": "stopped",
-        "tc_valid": True,
-        "offset": 0
-    })
-
-    if not state.get("tc_valid", False):
-        return state["status"], state["led"], "--:--:--:--", False, 0
-
-    total_frames = int(time.time() * 25) + int(state.get("offset", 0))
-    tc = frames_to_tcx2(total_frames)
-
-    return state["status"], state["led"], tc, True, total_frames
-
-
-def recv_hyperdeck_message(sock, timeout=0.6):
-    sock.settimeout(timeout)
-    data = b""
-
-    while True:
-        try:
-            chunk = sock.recv(4096)
-
-            if not chunk:
-                break
-
-            data += chunk
-
-            if b"\r\n\r\n" in data or b"\n\n" in data:
-                break
-
-        except socket.timeout:
-            break
-
-    return data.decode("utf-8", errors="replace")
-
-
-def parse_hyperdeck_info(text):
-    info = {}
-
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-
-        key, value = line.split(":", 1)
-        key = key.strip().lower()
-        value = value.strip()
-
-        info[key] = value
-
-    return info
-
-
-def tc_text_to_25fps_frames(tc_text, is_50fps=False):
-    try:
-        parts = tc_text.strip().split(":")
-
-        if len(parts) != 4:
-            return None
-
-        hh = int(parts[0])
-        mm = int(parts[1])
-        ss = int(parts[2])
-        ff = int(parts[3])
-
-        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
-            return None
-
-        # HyperDeck může hlásit 1080p50, ale frame hodnota se pro náš panel
-        # převádí na 25fps základ a na obrazovce se zobrazuje zpět jako TCx2.
-        if is_50fps or ff > 24:
-            ff = ff // 2
-
-        if not (0 <= ff <= 24):
-            return None
-
-        return ((hh * 60 * 60) + (mm * 60) + ss) * 25 + ff
-
-    except ValueError:
-        return None
-
-
-def get_real_state(deck):
-    ip = deck.get("ip", "").strip()
-
-    if not ip:
-        return "OFFLINE", "offline", "--:--:--:--", False, 0
-
-    try:
-        with socket.create_connection((ip, 9993), timeout=0.6) as sock:
-            recv_hyperdeck_message(sock, timeout=0.4)
-
-            sock.sendall(b"transport info\r\n")
-            response = recv_hyperdeck_message(sock, timeout=0.6)
-
-    except OSError:
-        return "OFFLINE", "offline", "--:--:--:--", False, 0
-
-    info = parse_hyperdeck_info(response)
-
-    status_raw = info.get("status", "").lower()
-    input_format = info.get("input video format", "").lower()
-    video_format = info.get("video format", "").lower()
-    tc_text = info.get("display timecode") or info.get("timecode") or ""
-
-    if input_format == "none":
-        return "NO SIGNAL", "warning", "--:--:--:--", False, 0
-
-    if status_raw in ("record", "recording"):
-        status_text = "RECORDING"
-        led_class = "recording"
-
-    elif status_raw in ("stopped", "stop", "preview", "idle"):
-        status_text = "STOPPED"
-        led_class = "stopped"
-
-    elif status_raw in ("play", "playing"):
-        status_text = "PLAYING"
-        led_class = "warning"
-
-    else:
-        status_text = status_raw.upper() if status_raw else "ONLINE"
-        led_class = "warning"
-
-    is_50fps = "50" in input_format or "50" in video_format
-    total_frames = tc_text_to_25fps_frames(tc_text, is_50fps=is_50fps)
-
-    if total_frames is None:
-        return status_text, led_class, "--:--:--:--", False, 0
-
-    return status_text, led_class, frames_to_tcx2(total_frames), True, total_frames
-
-
-def send_hyperdeck_command(deck, cmd):
-    ip = deck.get("ip", "").strip()
-
-    command_map = {
-        "rec": "record",
-        "stop": "stop"
-    }
-
-    command = command_map.get(cmd)
-
-    if not ip or not command:
-        return False, "bad command"
-
-    try:
-        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
-            recv_hyperdeck_message(sock, timeout=0.4)
-
-            sock.sendall(b"remote: override: true\r\n")
-            recv_hyperdeck_message(sock, timeout=0.5)
-
-            sock.sendall((command + "\r\n").encode("ascii"))
-            response = recv_hyperdeck_message(sock, timeout=1.0)
-
-    except OSError as e:
-        return False, str(e)
-
-    return "200 ok" in response.lower(), response.strip()
-
-
-def send_hyperdeck_commands_parallel(decks, cmd):
-    results = []
-
-    if not decks:
-        return results
-
-    max_workers = min(len(decks), 12)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(send_hyperdeck_command, deck, cmd): deck
-            for deck in decks
-        }
-
-        for future in as_completed(future_map):
-            deck = future_map[future]
-
-            try:
-                ok, response = future.result()
-            except Exception as e:
-                ok, response = False, str(e)
-
-            results.append({
-                "name": deck.get("name", ""),
-                "ip": deck.get("ip", ""),
-                "ok": ok,
-                "response": response
-            })
-
-    return results
-
-
-def make_alarm(cfg):
-    if not cfg.get("tc_compare", True):
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">TC COMPARE OFF</div>'
-
-    tolerance = int(cfg.get("tc_tolerance_frames", 2))
-
-    if not cfg.get("simulation", False):
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">REAL MODE – TRANSPORT INFO AKTIVNÍ</div>'
-
-    init_sim_states(len(cfg["decks"]))
-    recording = []
-
-    for i, deck in enumerate(cfg["decks"]):
-        state = SIM_STATES.get(i, {})
-
-        if state.get("status") not in ("RECORDING", "TC WARNING"):
-            continue
-
-        if not state.get("tc_valid", False):
-            continue
-
-        recording.append({
-            "name": deck.get("name", f"REC {i + 1}"),
-            "offset": int(state.get("offset", 0))
-        })
-
-    if len(recording) < 2:
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">SIMULATION MODE – není co porovnávat</div>'
-
-    ref = recording[0]
-    bad = []
-
-    for item in recording[1:]:
-        diff = item["offset"] - ref["offset"]
-
-        if abs(diff) > tolerance:
-            bad.append((item["name"], diff))
-
-    if bad:
-        parts = []
-
-        for name, diff in bad:
-            sign = "+" if diff > 0 else ""
-            parts.append(f"{html.escape(name)} {sign}{diff}f")
-
-        msg = ", ".join(parts)
-
-        return (
-            f'<div id="tcAlarm" class="alarm" style="display:block;">'
-            f'TC MISMATCH – reference {html.escape(ref["name"])} | {msg} | tolerance {tolerance}f'
-            f'</div>'
-        )
-
-    return (
-        f'<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">'
-        f'SIMULATION MODE – TC OK | tolerance {tolerance}f'
-        f'</div>'
-    )
 
 
 def transport_response_to_state(response):
@@ -426,9 +51,10 @@ def transport_response_to_state(response):
     input_format = info.get("input video format", "").lower()
     video_format = info.get("video format", "").lower()
     tc_text = info.get("display timecode") or info.get("timecode") or ""
+    format_text = input_format or video_format or "---"
 
     if input_format == "none":
-        return "NO SIGNAL", "warning", "--:--:--:--", False, 0
+        return "NO SIGNAL", "warning", format_text, "--:--:--:--", False, 0
 
     if status_raw in ("record", "recording"):
         status_text = "RECORDING"
@@ -450,9 +76,9 @@ def transport_response_to_state(response):
     total_frames = tc_text_to_25fps_frames(tc_text, is_50fps=is_50fps)
 
     if total_frames is None:
-        return status_text, led_class, "--:--:--:--", False, 0
+        return status_text, led_class, format_text, "--:--:--:--", False, 0
 
-    return status_text, led_class, format_tc_x2_from_25fps_frames(total_frames), True, total_frames
+    return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
 
 
 STATUS_LOCK = threading.Lock()
@@ -466,11 +92,11 @@ STATUS_TRANSPORT_TIMEOUT = 0.7
 
 
 def get_skipped_state():
-    return ("SKIPPED", "skipped", "--:--:--:--", False, 0)
+    return ("SKIPPED", "skipped", "---", "--:--:--:--", False, 0)
 
 
 def get_offline_state():
-    return ("OFFLINE", "offline", "--:--:--:--", False, 0)
+    return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0)
 
 
 def status_poller_loop(index, ip, stop_event):
@@ -551,7 +177,7 @@ def ensure_status_pollers(cfg):
         desired = {
             i: deck.get("ip", "").strip()
             for i, deck in enumerate(decks)
-            if deck_is_armed(deck) and deck.get("ip", "").strip()
+            if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip()
         }
 
     with STATUS_LOCK:
@@ -609,111 +235,162 @@ def get_status_map(cfg):
     if simulation:
         init_sim_states(len(decks))
         return {
-            i: get_sim_state(i) if (deck_is_armed(deck) or is_pgm_deck(deck.get("name", ""))) else get_skipped_state()
+            i: get_sim_state(i) if deck_is_armed_at_index(cfg, i, deck) else get_skipped_state()
             for i, deck in enumerate(decks)
         }
 
     if not decks:
         return result
 
-    with ThreadPoolExecutor(max_workers=min(len(decks), 12)) as executor:
-        future_map = {}
+    ensure_status_pollers(cfg)
 
-        for i, deck in enumerate(decks):
-            name = deck.get("name", "")
+    with STATUS_LOCK:
+        cached = STATUS_CACHE.copy()
 
-            if deck_is_armed(deck) or is_pgm_deck(name):
-                future_map[executor.submit(get_real_state, deck)] = i
-            else:
-                result[i] = get_skipped_state()
-
-        for future in as_completed(future_map):
-            i = future_map[future]
-
-            try:
-                result[i] = future.result()
-            except Exception:
-                result[i] = get_offline_state()
+    for i, deck in enumerate(decks):
+        if deck_is_armed_at_index(cfg, i, deck):
+            result[i] = cached.get(i, get_offline_state())
+        else:
+            result[i] = get_skipped_state()
 
     return result
 
 
+def build_tc_compare(cfg, status_map):
+    result = {
+        "enabled": bool(cfg.get("tc_compare", True)),
+        "tolerance": int(cfg.get("tc_tolerance_frames", 2)),
+        "reference": None,
+        "bad": [],
+        "by_index": {},
+        "ambiguous": False,
+        "reference_invalid": False,
+        "reference_mode": normalize_tc_reference_mode(cfg.get("tc_reference_mode", "group"))
+    }
 
-def make_rows(cfg):
-    rows = ""
-    simulation = cfg.get("simulation", False)
+    if not result["enabled"]:
+        return result
 
-    if simulation:
-        init_sim_states(len(cfg["decks"]))
+    candidates = []
 
-    status_map = get_status_map(cfg)
+    for i, deck in enumerate(cfg.get("decks", [])):
+        status = status_map.get(i, get_skipped_state())
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status
 
-    for i, deck in enumerate(cfg["decks"]):
-        raw_name = deck.get("name", "")
-        name = html.escape(raw_name)
-        ip = html.escape(deck.get("ip", ""))
+        if not deck_is_armed_at_index(cfg, i, deck):
+            continue
 
-        pgm = is_pgm_deck(raw_name)
-        armed = deck_is_armed(deck)
+        if not tc_valid:
+            continue
 
-        row_classes = []
+        candidates.append({
+            "index": i,
+            "name": deck.get("name", f"REC {i + 1}"),
+            "frames": int(total_frames)
+        })
 
-        if pgm:
-            row_classes.append("pgm-row")
+    if len(candidates) < 2:
+        return result
 
-        if not armed:
-            row_classes.append("disarmed-row")
+    if result["reference_mode"] == "control_room":
+        control_room_index = len(cfg.get("decks", [])) - 1
+        reference = None
 
-        row_class = " ".join(row_classes)
+        for candidate in candidates:
+            if candidate["index"] == control_room_index:
+                reference = candidate
+                break
 
-        if pgm:
-            arm_cell = '<td class="arm-cell always-arm"></td>'
-        else:
-            checked = "checked" if armed else ""
+        if reference is None:
+            result["reference_invalid"] = True
+            return result
 
-            arm_cell = f"""
-  <td class="arm-cell">
-    <form class="arm-form" method="POST" action="/toggle-arm">
-      <input type="hidden" name="deck" value="{i}">
-      <input class="arm-check" type="checkbox" name="armed" value="1" {checked} onchange="this.form.submit()">
-    </form>
-  </td>"""
+        result["reference"] = reference
 
-        status_text, led_class, tc, tc_valid, total_frames = status_map.get(
-            i,
-            get_skipped_state()
-        )
+        for item in candidates:
+            diff = item["frames"] - reference["frames"]
+            warning = item["index"] != reference["index"] and abs(diff) > result["tolerance"]
 
-        if tc_valid:
-            tc_cell = f'<td class="tc live-tc" data-role="tc" data-base-frame="{total_frames}">{tc}</td>'
-        else:
-            tc_cell = f'<td class="tc" data-role="tc">{tc}</td>'
+            result["by_index"][item["index"]] = {
+                "diff": diff,
+                "warning": warning
+            }
 
-        rows += f"""
-<tr class="{row_class}" data-deck-index="{i}">
-  {arm_cell}
-  <td class="name">{name}</td>
-  <td class="ip">{ip}</td>
-  <td>
-    <form class="inline-form" method="POST" action="/action">
-      <input type="hidden" name="deck" value="{i}">
-      <input type="hidden" name="cmd" value="rec">
-      <button class="btn rec" type="submit">REC</button>
-    </form>
-  </td>
-  <td>
-    <form class="inline-form" method="POST" action="/action">
-      <input type="hidden" name="deck" value="{i}">
-      <input type="hidden" name="cmd" value="stop">
-      <button class="btn stop" type="submit">STOP</button>
-    </form>
-  </td>
-  <td class="status" data-role="status"><span class="led {led_class}"></span> {status_text}</td>
-  {tc_cell}
-</tr>
-"""
+            if warning:
+                result["bad"].append({
+                    "name": item["name"],
+                    "diff": diff
+                })
 
-    return rows
+        return result
+
+    groups = []
+
+    for candidate in candidates:
+        placed = False
+
+        for group in groups:
+            if abs(candidate["frames"] - group["reference"]["frames"]) <= result["tolerance"]:
+                group["items"].append(candidate)
+                placed = True
+                break
+
+        if not placed:
+            groups.append({
+                "reference": candidate,
+                "items": [candidate]
+            })
+
+    groups.sort(key=lambda group: len(group["items"]), reverse=True)
+    largest_size = len(groups[0]["items"])
+    largest_groups = [
+        group
+        for group in groups
+        if len(group["items"]) == largest_size
+    ]
+    result["ambiguous"] = len(largest_groups) > 1
+
+    reference = groups[0]["reference"]
+    result["reference"] = reference
+    reference_indexes = {
+        item["index"]
+        for item in groups[0]["items"]
+    }
+
+    for item in candidates:
+        diff = item["frames"] - reference["frames"]
+        warning = item["index"] not in reference_indexes
+
+        result["by_index"][item["index"]] = {
+            "diff": diff,
+            "warning": warning
+        }
+
+        if warning:
+            result["bad"].append({
+                "name": item["name"],
+                "diff": diff
+            })
+
+    return result
+
+
+def format_tc_diff(diff):
+    if abs(diff) > 50:
+        return "+50+f" if diff > 0 else "-50+f"
+
+    sign = "+" if diff > 0 else ""
+    return f"{sign}{diff}f"
+
+
+def normalize_tc_reference_mode(value):
+    value = (value or "").strip().lower()
+
+    if value in ("group", "control_room"):
+        return value
+
+    return "group"
+
 
 
 TC_INPUT_VALUES = ("embedded", "external", "internal")
@@ -725,57 +402,110 @@ TC_INPUT_LABELS = {
 }
 
 
+def normalize_ipv4(value, fallback="", allow_empty=False):
+    value = (value or "").strip()
+
+    if allow_empty and not value:
+        return ""
+
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return fallback
+
+    if ip.version != 4:
+        return fallback
+
+    return str(ip)
+
+
+def normalize_format(value, fallback="1080p50"):
+    value = (value or "").strip()
+
+    if not value:
+        return fallback
+
+    return value.lower()
+
+
+def format_is_ok(format_text, expected_format="1080p50"):
+    expected = normalize_format(expected_format)
+    return (format_text or "").strip().lower() == expected
+
+
 
 
 def save_config(cfg):
-    CONFIG_FILE.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    data = json.dumps(cfg, ensure_ascii=False, indent=2)
+    tmp_file = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+
+    with tmp_file.open("w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_file, CONFIG_FILE)
+
+    try:
+        dir_fd = os.open(str(CONFIG_FILE.parent), os.O_DIRECTORY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def load_config():
     if not CONFIG_FILE.exists():
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
-
-    try:
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        cfg = DEFAULT_CONFIG.copy()
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        save_config(cfg)
+    else:
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = copy.deepcopy(DEFAULT_CONFIG)
 
     cfg.setdefault("panel_ip", "10.0.0.8")
     cfg.setdefault("atem_logger_ip", "10.0.0.9")
+    cfg.setdefault("expected_format", "1080p50")
+    cfg.setdefault("tc_reference_mode", "group")
     cfg.setdefault("simulation", True)
     cfg.setdefault("tc_compare", True)
     cfg.setdefault("tc_tolerance_frames", 2)
-    cfg.setdefault("decks", DEFAULT_CONFIG["decks"])
+    cfg.setdefault("decks", copy.deepcopy(DEFAULT_CONFIG["decks"]))
 
-    for deck in cfg["decks"]:
+    for index, deck in enumerate(cfg["decks"]):
         deck.setdefault("armed", True)
 
-        if is_pgm_deck(deck.get("name", "")):
+        if is_control_room_deck(cfg, index):
             deck["armed"] = True
 
     return cfg
 
 
-def is_pgm_deck(name):
-    return "PGM" in name.upper()
+def is_control_room_deck(cfg, index):
+    decks = cfg.get("decks", [])
+    return bool(decks) and index == len(decks) - 1
 
 
 def deck_is_armed(deck):
-    if is_pgm_deck(deck.get("name", "")):
+    return bool(deck.get("armed", True))
+
+
+def deck_is_armed_at_index(cfg, index, deck):
+    if is_control_room_deck(cfg, index):
         return True
 
-    return bool(deck.get("armed", True))
+    return deck_is_armed(deck)
 
 
 def get_armed_decks(cfg):
     return [
         deck
-        for deck in cfg.get("decks", [])
-        if deck_is_armed(deck)
+        for index, deck in enumerate(cfg.get("decks", []))
+        if deck_is_armed_at_index(cfg, index, deck)
     ]
 
 
@@ -783,7 +513,7 @@ def get_armed_deck_indexes(cfg):
     return [
         index
         for index, deck in enumerate(cfg.get("decks", []))
-        if deck_is_armed(deck)
+        if deck_is_armed_at_index(cfg, index, deck)
     ]
 
 
@@ -862,12 +592,12 @@ def get_sim_state(index):
     })
 
     if not state.get("tc_valid", False):
-        return state["status"], state["led"], "--:--:--:--", False, 0
+        return state["status"], state["led"], "---", "--:--:--:--", False, 0
 
     total_frames = int(time.time() * 25) + int(state.get("offset", 0))
     tc = frames_to_tcx2(total_frames)
 
-    return state["status"], state["led"], tc, True, total_frames
+    return state["status"], state["led"], "---", tc, True, total_frames
 
 
 def recv_hyperdeck_message(sock, timeout=0.6):
@@ -941,7 +671,7 @@ def get_real_state(deck):
     ip = deck.get("ip", "").strip()
 
     if not ip:
-        return "OFFLINE", "offline", "--:--:--:--", False, 0
+        return "OFFLINE", "offline", "---", "--:--:--:--", False, 0
 
     try:
         with socket.create_connection((ip, 9993), timeout=0.25) as sock:
@@ -951,7 +681,7 @@ def get_real_state(deck):
             response = recv_hyperdeck_message(sock, timeout=0.6)
 
     except OSError:
-        return "OFFLINE", "offline", "--:--:--:--", False, 0
+        return "OFFLINE", "offline", "---", "--:--:--:--", False, 0
 
     info = parse_hyperdeck_info(response)
 
@@ -959,9 +689,10 @@ def get_real_state(deck):
     input_format = info.get("input video format", "").lower()
     video_format = info.get("video format", "").lower()
     tc_text = info.get("display timecode") or info.get("timecode") or ""
+    format_text = input_format or video_format or "---"
 
     if input_format == "none":
-        return "NO SIGNAL", "warning", "--:--:--:--", False, 0
+        return "NO SIGNAL", "warning", format_text, "--:--:--:--", False, 0
 
     if status_raw in ("record", "recording"):
         status_text = "RECORDING"
@@ -983,9 +714,9 @@ def get_real_state(deck):
     total_frames = tc_text_to_25fps_frames(tc_text, is_50fps=is_50fps)
 
     if total_frames is None:
-        return status_text, led_class, "--:--:--:--", False, 0
+        return status_text, led_class, format_text, "--:--:--:--", False, 0
 
-    return status_text, led_class, frames_to_tcx2(total_frames), True, total_frames
+    return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
 
 
 def send_hyperdeck_command(deck, cmd):
@@ -1109,9 +840,7 @@ def get_tc_input_map(cfg):
     result = {}
 
     for i, deck in enumerate(cfg.get("decks", [])):
-        name = deck.get("name", "")
-
-        if deck_is_armed(deck) or is_pgm_deck(name):
+        if deck_is_armed_at_index(cfg, i, deck):
             result[i] = get_hyperdeck_timecode_input(deck)
         else:
             result[i] = "---"
@@ -1181,48 +910,34 @@ def make_alarm(cfg):
     if not cfg.get("tc_compare", True):
         return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">TC COMPARE OFF</div>'
 
-    tolerance = int(cfg.get("tc_tolerance_frames", 2))
+    status_map = get_status_map(cfg)
+    tc_compare = build_tc_compare(cfg, status_map)
 
-    if not cfg.get("simulation", False):
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">REAL MODE – TRANSPORT INFO AKTIVNÍ</div>'
+    if tc_compare.get("reference_invalid", False):
+        return '<div id="tcAlarm" class="alarm" style="display:block;">TC REFERENCE INVALID – Režie nemá platný TC</div>'
 
-    init_sim_states(len(cfg["decks"]))
-    recording = []
+    if not tc_compare["reference"]:
+        mode = "SIMULATION MODE" if cfg.get("simulation", False) else "REAL MODE"
+        return f'<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">{mode} – není co porovnávat</div>'
 
-    for i, deck in enumerate(cfg["decks"]):
-        state = SIM_STATES.get(i, {})
-
-        if state.get("status") not in ("RECORDING", "TC WARNING"):
-            continue
-
-        if not state.get("tc_valid", False):
-            continue
-
-        recording.append({
-            "name": deck.get("name", f"REC {i + 1}"),
-            "offset": int(state.get("offset", 0))
-        })
-
-    if len(recording) < 2:
-        return '<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">SIMULATION MODE – není co porovnávat</div>'
-
-    ref = recording[0]
-    bad = []
-
-    for item in recording[1:]:
-        diff = item["offset"] - ref["offset"]
-
-        if abs(diff) > tolerance:
-            bad.append((item["name"], diff))
-
-    if bad:
+    if tc_compare["bad"]:
         parts = []
 
-        for name, diff in bad:
-            sign = "+" if diff > 0 else ""
-            parts.append(f"{html.escape(name)} {sign}{diff}f")
+        for item in tc_compare["bad"]:
+            name = item["name"]
+            diff = item["diff"]
+            parts.append(f"{html.escape(name)} {format_tc_diff(diff)}")
 
         msg = ", ".join(parts)
+        ref = tc_compare["reference"]
+        tolerance = tc_compare["tolerance"]
+
+        if tc_compare.get("ambiguous", False):
+            return (
+                f'<div id="tcAlarm" class="alarm" style="display:block;">'
+                f'TC MISMATCH | {msg} | tolerance {tolerance}f'
+                f'</div>'
+            )
 
         return (
             f'<div id="tcAlarm" class="alarm" style="display:block;">'
@@ -1230,9 +945,12 @@ def make_alarm(cfg):
             f'</div>'
         )
 
+    mode = "SIMULATION MODE" if cfg.get("simulation", False) else "REAL MODE"
+    tolerance = tc_compare["tolerance"]
+
     return (
         f'<div id="tcAlarm" class="alarm simulation-ok" style="display:block;">'
-        f'SIMULATION MODE – TC OK | tolerance {tolerance}f'
+        f'{mode} – TC OK | tolerance {tolerance}f'
         f'</div>'
     )
 
@@ -1240,56 +958,50 @@ def make_alarm(cfg):
 def make_rows(cfg):
     rows = ""
     simulation = cfg.get("simulation", False)
+    expected_format = cfg.get("expected_format", "1080p50")
 
     if simulation:
         init_sim_states(len(cfg["decks"]))
+
+    status_map = get_status_map(cfg)
+    tc_compare = build_tc_compare(cfg, status_map)
 
     for i, deck in enumerate(cfg["decks"]):
         raw_name = deck.get("name", "")
         name = html.escape(raw_name)
         ip = html.escape(deck.get("ip", ""))
 
-        pgm = is_pgm_deck(raw_name)
-        armed = deck_is_armed(deck)
+        pgm = is_control_room_deck(cfg, i)
+        armed = deck_is_armed_at_index(cfg, i, deck)
+
+        if not armed:
+            continue
 
         row_classes = []
 
         if pgm:
             row_classes.append("pgm-row")
 
-        if not armed:
-            row_classes.append("disarmed-row")
-
         row_class = " ".join(row_classes)
 
-        if pgm:
-            arm_cell = '<td class="arm-cell always-arm"></td>'
-        else:
-            checked = "checked" if armed else ""
-
-            arm_cell = f"""
-  <td class="arm-cell">
-    <form class="arm-form" method="POST" action="/toggle-arm">
-      <input type="hidden" name="deck" value="{i}">
-      <input class="arm-check" type="checkbox" name="armed" value="1" {checked} onchange="this.form.submit()">
-    </form>
-  </td>"""
-
-        if simulation:
-            status_text, led_class, tc, tc_valid, total_frames = get_sim_state(i)
-        else:
-            status_text, led_class, tc, tc_valid, total_frames = get_real_state(deck)
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status_map.get(
+            i,
+            get_skipped_state()
+        )
+        format_html = html.escape(format_text or "---")
+        format_class = "format" if format_is_ok(format_text, expected_format) else "format format-warning"
+        tc_warning = tc_compare["by_index"].get(i, {}).get("warning", False)
+        tc_class = "tc tc-warning" if tc_warning else "tc"
 
         if tc_valid:
-            tc_cell = f'<td class="tc live-tc" data-role="tc" data-base-frame="{total_frames}">{tc}</td>'
+            tc_cell = f'<td class="{tc_class} live-tc" data-role="tc" data-base-frame="{total_frames}">{tc}</td>'
         else:
-            tc_cell = f'<td class="tc" data-role="tc">{tc}</td>'
+            tc_cell = f'<td class="{tc_class}" data-role="tc">{tc}</td>'
 
         rows += f"""
 <tr class="{row_class}" data-deck-index="{i}">
-  {arm_cell}
-  <td class="name">{name}</td>
   <td class="ip">{ip}</td>
+  <td class="name">{name}</td>
   <td>
     <form class="inline-form" method="POST" action="/action">
       <input type="hidden" name="deck" value="{i}">
@@ -1305,6 +1017,7 @@ def make_rows(cfg):
     </form>
   </td>
   <td class="status" data-role="status"><span class="led {led_class}"></span> {status_text}</td>
+  <td class="{format_class}" data-role="format">{format_html}</td>
   {tc_cell}
 </tr>
 """
@@ -1325,12 +1038,24 @@ def make_settings_rows(cfg, load_tc_inputs=False):
         raw_name = deck.get("name", "")
         name = html.escape(raw_name, quote=True)
         ip = html.escape(deck.get("ip", ""), quote=True)
-        row_class = "pgm-row" if is_pgm_deck(raw_name) else ""
+        control_room = is_control_room_deck(cfg, i)
+        row_class = "pgm-row" if control_room else ""
         current_tc = tc_inputs.get(i, "---")
         tc_select = make_tc_input_select(i, current_tc)
 
+        if control_room:
+            arm_cell = '<td class="arm-cell always-arm"></td>'
+        else:
+            checked = "checked" if deck_is_armed(deck) else ""
+            arm_cell = (
+                '<td class="arm-cell">'
+                f'<input class="arm-check" type="checkbox" name="deck_armed_{i}" value="1" {checked}>'
+                '</td>'
+            )
+
         rows += f"""
 <tr class="{row_class}">
+  {arm_cell}
   <td>
     <input class="text-input name-input" type="text" name="deck_name_{i}" value="{name}">
   </td>
@@ -1394,13 +1119,17 @@ th,td{padding:8px 10px;border-bottom:1px solid #33333d;text-align:center;font-si
 tr:last-child td{border-bottom:none}
 th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;background:#1d1d28}
 /* column layout start */
-th:nth-child(1),td:nth-child(1){width:10%}
-th:nth-child(2),td:nth-child(2){width:13%}
-th:nth-child(3),td:nth-child(3){width:13%}
-th:nth-child(4),td:nth-child(4){width:13%}
-th:nth-child(5),td:nth-child(5){width:13%}
-th:nth-child(6),td:nth-child(6){width:18%}
-th:nth-child(7),td:nth-child(7){width:20%}
+.decks-table th:nth-child(1),.decks-table td:nth-child(1){width:14%}
+.decks-table th:nth-child(2),.decks-table td:nth-child(2){width:13%}
+.decks-table th:nth-child(3),.decks-table td:nth-child(3){width:12%}
+.decks-table th:nth-child(4),.decks-table td:nth-child(4){width:12%}
+.decks-table th:nth-child(5),.decks-table td:nth-child(5){width:18%}
+.decks-table th:nth-child(6),.decks-table td:nth-child(6){width:13%}
+.decks-table th:nth-child(7),.decks-table td:nth-child(7){width:18%}
+.settings-table th:nth-child(1),.settings-table td:nth-child(1){width:10%}
+.settings-table th:nth-child(2),.settings-table td:nth-child(2){width:31%}
+.settings-table th:nth-child(3),.settings-table td:nth-child(3){width:31%}
+.settings-table th:nth-child(4),.settings-table td:nth-child(4){width:28%}
 /* column layout end */
 
 
@@ -1409,12 +1138,16 @@ th:nth-child(7),td:nth-child(7){width:20%}
 
 
 .arm-cell{width:auto;padding-left:82px;padding-right:52px;text-align:center}
+.settings-table .arm-cell{padding-left:6px;padding-right:6px}
 .arm-form{margin:0}
 .arm-check{width:24px;height:24px;cursor:pointer;vertical-align:-5px}
 .always-arm{font-size:14px;font-weight:bold;color:#78ff9c;letter-spacing:1px}
 .name{font-weight:bold;text-align:center;font-size:23px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ip{color:#b8b8c0;font-size:16px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tc{font-family:monospace;font-size:29px;letter-spacing:1px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tc-warning{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45)}
+.format{font-family:monospace;font-size:21px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.format-warning{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45)}
 .status{font-weight:bold;width:auto;min-width:0;max-width:none;text-align:left;padding-left:82px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .led{display:inline-block;width:22px;height:22px;border-radius:50%;margin-right:10px;vertical-align:-3px;background:#777;box-shadow:0 0 10px #777}
 .stopped{background:#1b6cff;box-shadow:0 0 18px #1b6cff}
@@ -1595,15 +1328,15 @@ body.initial-settings .settings-panel {
 
   <div id="viewDecks" class="view active">
     <div class="panel-card">
-      <table>
+      <table class="decks-table">
         <thead>
           <tr>
-            <th></th>
-            <th>Deck</th>
             <th>IP</th>
+            <th>Deck</th>
             <th>Rec</th>
             <th>Stop</th>
             <th>Status</th>
+            <th>Format</th>
             <th>TC</th>
           </tr>
         </thead>
@@ -1639,6 +1372,15 @@ body.initial-settings .settings-panel {
       <div class="small-label" style="margin-top:12px;">ATEM LOGGER IP</div>
       <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
 
+      <div class="small-label" style="margin-top:12px;">FORMÁT</div>
+      <input class="text-input ip-input" type="text" name="expected_format" value="__EXPECTED_FORMAT__">
+
+      <div class="small-label" style="margin-top:12px;">REFERENCE TC</div>
+      <select class="text-input ip-input" name="tc_reference_mode">
+        <option value="group" __TC_REF_GROUP_SELECTED__>Skupina</option>
+        <option value="control_room" __TC_REF_CONTROL_ROOM_SELECTED__>Režie</option>
+      </select>
+
       <div class="settings-switch-row">
         <label class="check-label">
           <input type="checkbox" name="simulation" value="1" __SIMULATION_CHECKED__>
@@ -1655,9 +1397,10 @@ body.initial-settings .settings-panel {
       <input class="text-input ip-input" type="number" min="0" max="50" name="tc_tolerance_frames" value="__TC_TOLERANCE_FRAMES__">
 
       <div class="panel-card">
-        <table>
+        <table class="settings-table">
           <thead>
             <tr>
+              <th>ARM</th>
               <th>Deck name</th>
               <th>IP address</th>
               <th>TC IN</th>
@@ -1808,7 +1551,19 @@ function applyStatusData(data) {
     const statusCell = row.querySelector('[data-role="status"]');
 
     if (statusCell) {
-      statusCell.innerHTML = `<span class="led ${deck.led}"></span> ${deck.status}`;
+      statusCell.textContent = "";
+
+      const led = document.createElement("span");
+      led.className = `led ${deck.led}`;
+      statusCell.appendChild(led);
+      statusCell.appendChild(document.createTextNode(` ${deck.status}`));
+    }
+
+    const formatCell = row.querySelector('[data-role="format"]');
+
+    if (formatCell) {
+      formatCell.textContent = deck.format || "---";
+      formatCell.classList.toggle("format-warning", !deck.format_ok);
     }
 
     const tcCell = row.querySelector('[data-role="tc"]');
@@ -1816,12 +1571,14 @@ function applyStatusData(data) {
     if (tcCell) {
       if (deck.tc_valid) {
         tcCell.classList.add("live-tc");
+        tcCell.classList.toggle("tc-warning", !!deck.tc_warning);
         tcCell.dataset.baseFrame = String(deck.total_frames);
         tcCell.dataset.startFrame = String(deck.total_frames);
         tcCell.dataset.startMs = String(Date.now());
         tcCell.textContent = deck.tc;
       } else {
         tcCell.classList.remove("live-tc");
+        tcCell.classList.remove("tc-warning");
         delete tcCell.dataset.baseFrame;
         delete tcCell.dataset.startFrame;
         delete tcCell.dataset.startMs;
@@ -1963,14 +1720,20 @@ setTimeout(() => {
 def build_status_api():
     cfg = load_config()
     simulation = cfg.get("simulation", False)
+    expected_format = cfg.get("expected_format", "1080p50")
     decks_out = []
     status_map = get_status_map(cfg)
+    tc_compare = build_tc_compare(cfg, status_map)
 
     for i, deck in enumerate(cfg["decks"]):
-        status_text, led_class, tc, tc_valid, total_frames = status_map.get(
+        if not deck_is_armed_at_index(cfg, i, deck):
+            continue
+
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status_map.get(
             i,
             get_skipped_state()
         )
+        tc_info = tc_compare["by_index"].get(i, {})
 
         decks_out.append({
             "index": i,
@@ -1978,10 +1741,14 @@ def build_status_api():
             "ip": deck.get("ip", ""),
             "status": status_text,
             "led": led_class,
+            "format": format_text,
+            "format_ok": format_is_ok(format_text, expected_format),
             "tc": tc,
             "tc_valid": bool(tc_valid),
+            "tc_warning": bool(tc_info.get("warning", False)),
+            "tc_diff_frames": int(tc_info.get("diff", 0)),
             "total_frames": int(total_frames),
-            "armed": deck_is_armed(deck)
+            "armed": deck_is_armed_at_index(cfg, i, deck)
         })
 
     return {
@@ -2071,6 +1838,10 @@ def build_page(saved=False, initial_view="hyperdeck"):
 
     panel_ip = html.escape(cfg.get("panel_ip", "10.0.0.8"))
     atem_logger_ip = html.escape(cfg.get("atem_logger_ip", "10.0.0.9"))
+    expected_format = html.escape(
+        normalize_format(cfg.get("expected_format", "1080p50")),
+        quote=True
+    )
 
     notice = ""
     if saved:
@@ -2079,11 +1850,15 @@ def build_page(saved=False, initial_view="hyperdeck"):
     simulation_checked = "checked" if cfg.get("simulation", False) else ""
     tc_compare_checked = "checked" if cfg.get("tc_compare", True) else ""
     tc_tolerance_frames = html.escape(str(cfg.get("tc_tolerance_frames", 2)))
+    tc_reference_mode = normalize_tc_reference_mode(cfg.get("tc_reference_mode", "group"))
+    tc_ref_group_selected = "selected" if tc_reference_mode == "group" else ""
+    tc_ref_control_room_selected = "selected" if tc_reference_mode == "control_room" else ""
     status_poll_enabled = "false" if cfg.get("simulation", False) else "true"
 
     page = HTML_TEMPLATE
 
-    atem_logger_ip = cfg.get("atem_logger_ip", "10.0.0.9").strip() or "10.0.0.9"
+    atem_logger_ip_raw = cfg.get("atem_logger_ip", "10.0.0.9").strip() or "10.0.0.9"
+    atem_logger_ip = html.escape(atem_logger_ip_raw, quote=True)
     page = page.replace("__ATEM_LOGGER_URL__", f"http://{atem_logger_ip}/")
 
     # initial settings body class start
@@ -2104,6 +1879,9 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__SETTINGS_ROWS__", make_settings_rows(cfg, load_tc_inputs=(initial_view == "settings")))
     page = page.replace("__PANEL_IP__", panel_ip)
     page = page.replace("__ATEM_LOGGER_IP__", atem_logger_ip)
+    page = page.replace("__EXPECTED_FORMAT__", expected_format)
+    page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
+    page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
     page = page.replace("__SIMULATION_CHECKED__", simulation_checked)
     page = page.replace("__TC_COMPARE_CHECKED__", tc_compare_checked)
     page = page.replace("__TC_TOLERANCE_FRAMES__", tc_tolerance_frames)
@@ -2118,9 +1896,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/api/status":
-
-
-            stop_all_status_pollers(pause_seconds=0)
             payload = json.dumps(build_status_api(), ensure_ascii=False).encode("utf-8")
 
             self.send_response(200)
@@ -2158,7 +1933,7 @@ class Handler(BaseHTTPRequestHandler):
                 if 0 <= deck_index < len(cfg["decks"]):
                     deck = cfg["decks"][deck_index]
 
-                    if not is_pgm_deck(deck.get("name", "")):
+                    if not is_control_room_deck(cfg, deck_index):
                         deck["armed"] = "armed" in form
                         cfg["decks"][deck_index] = deck
                         save_config(cfg)
@@ -2219,15 +1994,39 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/save-settings":
             cfg = load_config()
 
-            cfg["panel_ip"] = form.get(
+            panel_ip = form.get(
                 "panel_ip",
                 [cfg.get("panel_ip", "10.0.0.8")]
             )[0].strip()
 
-            cfg["atem_logger_ip"] = form.get(
+            cfg["panel_ip"] = normalize_ipv4(
+                panel_ip,
+                cfg.get("panel_ip", "10.0.0.8")
+            )
+
+            atem_logger_ip = form.get(
                 "atem_logger_ip",
                 [cfg.get("atem_logger_ip", "10.0.0.9")]
             )[0].strip()
+
+            cfg["atem_logger_ip"] = normalize_ipv4(
+                atem_logger_ip,
+                cfg.get("atem_logger_ip", "10.0.0.9")
+            )
+
+            expected_format = form.get(
+                "expected_format",
+                [cfg.get("expected_format", "1080p50")]
+            )[0].strip()
+
+            cfg["expected_format"] = normalize_format(expected_format)
+
+            tc_reference_mode = form.get(
+                "tc_reference_mode",
+                [cfg.get("tc_reference_mode", "group")]
+            )[0].strip()
+
+            cfg["tc_reference_mode"] = normalize_tc_reference_mode(tc_reference_mode)
 
             cfg["simulation"] = "simulation" in form
             cfg["tc_compare"] = "tc_compare" in form
@@ -2256,12 +2055,18 @@ class Handler(BaseHTTPRequestHandler):
                     [old_deck.get("ip", "")]
                 )[0].strip()
 
+                ip = normalize_ipv4(
+                    ip,
+                    old_deck.get("ip", ""),
+                    allow_empty=True
+                )
+
                 if not name:
                     name = old_deck.get("name", f"REC {i + 1}")
 
-                armed = deck_is_armed(old_deck)
+                armed = f"deck_armed_{i}" in form
 
-                if is_pgm_deck(name):
+                if is_control_room_deck(cfg, i):
                     armed = True
 
                 new_decks.append({
@@ -2276,10 +2081,8 @@ class Handler(BaseHTTPRequestHandler):
             for i, deck in enumerate(cfg.get("decks", [])):
                 tc_input = form.get(f"deck_tc_input_{i}", [""])[0].strip().lower()
                 tc_original = form.get(f"deck_tc_original_{i}", ["---"])[0].strip().lower()
-                name = deck.get("name", "")
-
                 if (
-                    (deck_is_armed(deck) or is_pgm_deck(name))
+                    deck_is_armed_at_index(cfg, i, deck)
                     and tc_input in TC_INPUT_VALUES
                     and tc_input != tc_original
                 ):
