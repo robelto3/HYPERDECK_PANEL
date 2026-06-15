@@ -16,6 +16,7 @@ import re
 HOST = "0.0.0.0"
 PORT = 8080
 CONFIG_FILE = Path("config.json")
+ADVANCED_NVM_FILE = Path("advanced_nvm.json")
 PANEL_BROWSER_URL = f"http://127.0.0.1:{PORT}/"
 
 DEFAULT_CONFIG = {
@@ -38,6 +39,11 @@ DEFAULT_CONFIG = {
         {"name": "Cam 10", "ip": ""},
         {"name": "Režie", "ip": "10.0.0.24"}
     ]
+}
+
+DEFAULT_ADVANCED_NVM = {
+    "format_ip_hd_mini": "",
+    "format_ip_4k_pro": ""
 }
 
 
@@ -81,6 +87,155 @@ def transport_response_to_state(response):
     return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
 
 
+def format_video_rate(format_text):
+    match = re.search(r"(\d{3,4})([pi])(\d+(?:\.\d+)?)", (format_text or "").lower())
+
+    if not match:
+        return None
+
+    height = int(match.group(1))
+    scan = match.group(2)
+    fps = float(match.group(3))
+
+    if scan == "i":
+        fps = fps / 2
+
+    if height >= 2160:
+        width = 3840
+    elif height >= 1080:
+        width = 1920
+    elif height >= 720:
+        width = 1280
+    else:
+        width = int(height * 16 / 9)
+
+    return width * height * fps
+
+
+def scale_recording_seconds(recording_seconds, source_format, target_format):
+    source_rate = format_video_rate(source_format)
+    target_rate = format_video_rate(target_format)
+
+    if not source_rate or not target_rate:
+        return recording_seconds
+
+    return int(recording_seconds * source_rate / target_rate)
+
+
+def format_recording_time(seconds):
+    seconds = max(0, int(seconds))
+
+    if seconds < 3600:
+        minutes = seconds // 60
+        seconds %= 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    minutes = seconds // 60
+    hours = minutes // 60
+    minutes %= 60
+
+    if hours >= 24:
+        days = hours // 24
+        hours %= 24
+        return f"{days}d {hours:02d}h"
+
+    return f"{hours}h{minutes:02d}"
+
+
+def parse_positive_int(value):
+    try:
+        number = int((value or "").strip())
+    except ValueError:
+        return 0
+
+    return max(0, number)
+
+
+def slot_has_space_but_no_recording_time(info):
+    remaining_size = parse_positive_int(info.get("remaining size", ""))
+    total_size = parse_positive_int(info.get("total size", ""))
+
+    if remaining_size < 1_000_000_000:
+        return False
+
+    if total_size <= 0:
+        return True
+
+    return remaining_size / total_size > 0.05
+
+
+def slot_is_locked(info):
+    values = [
+        info.get("blocked", ""),
+        info.get("status", ""),
+        info.get("volume name", ""),
+        info.get("slot name", ""),
+        info.get("device", ""),
+    ]
+    text = " ".join(values).lower()
+
+    return any(
+        marker in text
+        for marker in ("true", "locked", "lock", "write protected", "write-protected", "read only", "readonly", "blocked")
+    )
+
+
+def slot_response_to_remaining_time(response, source_format, target_format):
+    if not response.startswith("202 slot info"):
+        return "---", "sd-empty"
+
+    info = parse_hyperdeck_info(response)
+    status = info.get("status", "").lower()
+
+    if slot_is_locked(info):
+        return "Lock", "sd-warning"
+
+    if status and status != "mounted":
+        return "---", "sd-empty"
+
+    recording_time = info.get("recording time", "").strip()
+    slot_format = info.get("video format", "").strip().lower()
+
+    try:
+        recording_seconds = int(recording_time)
+    except ValueError:
+        if status == "mounted":
+            return "Full", "sd-full"
+
+        return "---", "sd-empty"
+
+    if recording_seconds <= 0:
+        if status == "mounted" and slot_has_space_but_no_recording_time(info):
+            return "Lock", "sd-warning"
+
+        return "Full", "sd-full"
+
+    if slot_format and slot_format != "none":
+        source_format = slot_format
+
+    scaled_seconds = scale_recording_seconds(
+        recording_seconds,
+        source_format,
+        target_format
+    )
+
+    return format_recording_time(scaled_seconds), ""
+
+
+def normalize_sd_state(sd_state):
+    if isinstance(sd_state, (list, tuple)) and len(sd_state) >= 2:
+        text = str(sd_state[0] or "---")
+        css_class = str(sd_state[1] or "")
+    else:
+        text = str(sd_state or "---")
+        css_class = ""
+
+    if text == "---" and not css_class:
+        css_class = "sd-empty"
+
+    return text, css_class
+
+
 STATUS_LOCK = threading.Lock()
 STATUS_POLLERS = {}
 STATUS_POLLERS_PAUSED = False
@@ -92,11 +247,11 @@ STATUS_TRANSPORT_TIMEOUT = 0.7
 
 
 def get_skipped_state():
-    return ("SKIPPED", "skipped", "---", "--:--:--:--", False, 0)
+    return ("SKIPPED", "skipped", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"))
 
 
 def get_offline_state():
-    return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0)
+    return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"))
 
 
 def make_status_cache_entry(state):
@@ -107,7 +262,8 @@ def make_status_cache_entry(state):
 
 
 def normalize_state_to_snapshot(state, updated_monotonic, snapshot_monotonic):
-    status_text, led_class, format_text, tc, tc_valid, total_frames = state
+    status_text, led_class, format_text, tc, tc_valid, total_frames = state[:6]
+    extra = state[6:]
 
     if not tc_valid:
         return state
@@ -123,7 +279,7 @@ def normalize_state_to_snapshot(state, updated_monotonic, snapshot_monotonic):
         frames_to_tcx2(normalized_frames),
         tc_valid,
         normalized_frames
-    )
+    ) + extra
 
 
 def read_status_cache_entry(entry, snapshot_monotonic):
@@ -135,9 +291,10 @@ def read_status_cache_entry(entry, snapshot_monotonic):
     return entry
 
 
-def status_poller_loop(index, ip, stop_event):
+def status_poller_loop(index, ip, expected_format, stop_event):
     sock = None
     fail_count = 0
+    default_standard = None
 
     def close_sock():
         nonlocal sock
@@ -154,6 +311,35 @@ def status_poller_loop(index, ip, stop_event):
         recv_hyperdeck_message(new_sock, timeout=STATUS_HELLO_TIMEOUT)
         return new_sock
 
+    def read_default_standard(sock):
+        nonlocal default_standard
+
+        if default_standard:
+            return default_standard
+
+        try:
+            sock.sendall(b"configuration\r\n")
+            response = recv_hyperdeck_message(sock, timeout=STATUS_TRANSPORT_TIMEOUT)
+            info = parse_hyperdeck_info(response)
+            default_standard = info.get("default standard", "") or expected_format
+        except OSError:
+            default_standard = expected_format
+
+        return default_standard
+
+    def read_slot_remaining_time(sock, slot_id):
+        try:
+            sock.sendall(f"slot info: slot id: {slot_id}\r\n".encode("ascii"))
+            response = recv_hyperdeck_message(sock, timeout=STATUS_TRANSPORT_TIMEOUT)
+        except OSError:
+            return "---", "sd-empty"
+
+        return slot_response_to_remaining_time(
+            response,
+            read_default_standard(sock),
+            expected_format
+        )
+
     def read_transport_once():
         nonlocal sock
 
@@ -162,7 +348,10 @@ def status_poller_loop(index, ip, stop_event):
 
         sock.sendall(b"transport info\r\n")
         response = recv_hyperdeck_message(sock, timeout=STATUS_TRANSPORT_TIMEOUT)
-        return transport_response_to_state(response)
+        state = transport_response_to_state(response)
+        sd1 = read_slot_remaining_time(sock, 1)
+        sd2 = read_slot_remaining_time(sock, 2)
+        return state + (sd1, sd2)
 
     while not stop_event.is_set():
         try:
@@ -205,8 +394,12 @@ def ensure_status_pollers(cfg):
     if STATUS_POLLERS_PAUSED:
         return
     decks = cfg.get("decks", [])
+    expected_format = normalize_format(cfg.get("expected_format", "1080p50"))
     desired = {
-        i: deck.get("ip", "").strip()
+        i: {
+            "ip": deck.get("ip", "").strip(),
+            "expected_format": expected_format,
+        }
         for i, deck in enumerate(decks)
         if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip()
     }
@@ -217,9 +410,14 @@ def ensure_status_pollers(cfg):
     # Zastavit pollery, které už nemají běžet nebo mají jinou IP.
     for index, item in existing:
         old_ip = item["ip"]
+        old_expected_format = item.get("expected_format", "")
         stop_event = item["stop"]
 
-        if index not in desired or desired[index] != old_ip:
+        if (
+            index not in desired
+            or desired[index]["ip"] != old_ip
+            or desired[index]["expected_format"] != old_expected_format
+        ):
             stop_event.set()
 
             with STATUS_LOCK:
@@ -233,7 +431,10 @@ def ensure_status_pollers(cfg):
                 STATUS_CACHE[i] = make_status_cache_entry(get_skipped_state())
 
     # Spustit nové pollery.
-    for index, ip in desired.items():
+    for index, poller_config in desired.items():
+        ip = poller_config["ip"]
+        poller_expected_format = poller_config["expected_format"]
+
         with STATUS_LOCK:
             already_running = index in STATUS_POLLERS
 
@@ -243,7 +444,7 @@ def ensure_status_pollers(cfg):
         stop_event = threading.Event()
         thread = threading.Thread(
             target=status_poller_loop,
-            args=(index, ip, stop_event),
+            args=(index, ip, poller_expected_format, stop_event),
             daemon=True
         )
 
@@ -251,6 +452,7 @@ def ensure_status_pollers(cfg):
             STATUS_CACHE[index] = make_status_cache_entry(get_offline_state())
             STATUS_POLLERS[index] = {
                 "ip": ip,
+                "expected_format": poller_expected_format,
                 "stop": stop_event,
                 "thread": thread,
             }
@@ -300,7 +502,7 @@ def build_tc_compare(cfg, status_map):
 
     for i, deck in enumerate(cfg.get("decks", [])):
         status = status_map.get(i, get_skipped_state())
-        status_text, led_class, format_text, tc, tc_valid, total_frames = status
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status[:6]
 
         if not deck_is_armed_at_index(cfg, i, deck):
             continue
@@ -480,6 +682,55 @@ def save_config(cfg):
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def save_json_atomic(path, data):
+    serialized = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp_file = path.with_name(path.name + ".tmp")
+
+    with tmp_file.open("w", encoding="utf-8") as f:
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_file, path)
+
+    try:
+        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def load_advanced_nvm():
+    data = copy.deepcopy(DEFAULT_ADVANCED_NVM)
+
+    if ADVANCED_NVM_FILE.exists():
+        try:
+            loaded = json.loads(ADVANCED_NVM_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            loaded = {}
+
+        if isinstance(loaded, dict):
+            data.update({
+                key: str(loaded.get(key, value)).strip()
+                for key, value in DEFAULT_ADVANCED_NVM.items()
+            })
+
+    return data
+
+
+def save_advanced_nvm(data):
+    nvm = copy.deepcopy(DEFAULT_ADVANCED_NVM)
+    nvm.update({
+        key: str(data.get(key, value)).strip()
+        for key, value in DEFAULT_ADVANCED_NVM.items()
+    })
+    save_json_atomic(ADVANCED_NVM_FILE, nvm)
 
 
 def load_config():
@@ -719,6 +970,94 @@ def send_hyperdeck_command(deck, cmd):
     return "200 ok" in response.lower(), response.strip()
 
 
+def format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT"):
+    ip = normalize_ipv4(ip, "", allow_empty=True)
+
+    if not ip:
+        return False, "Chybí IP adresa."
+
+    def wait_for_slot_mounted(sock, wait_seconds=45):
+        deadline = time.monotonic() + wait_seconds
+        last_response = ""
+
+        while time.monotonic() < deadline:
+            sock.sendall(f"slot info: slot id: {slot_id}\r\n".encode("ascii"))
+            last_response = recv_hyperdeck_message(sock, timeout=1.0)
+            info = parse_hyperdeck_info(last_response)
+
+            if info.get("status", "").strip().lower() == "mounted":
+                return True, last_response.strip()
+
+            time.sleep(0.5)
+
+        return False, last_response.strip() or "Čekání na dokončení formátování vypršelo."
+
+    try:
+        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
+            recv_hyperdeck_message(sock, timeout=0.4)
+
+            sock.sendall(b"remote: override: true\r\n")
+            recv_hyperdeck_message(sock, timeout=0.5)
+
+            prepare_command = f"format: slot id: {slot_id} prepare: {filesystem}"
+            sock.sendall((prepare_command + "\r\n").encode("ascii"))
+            prepare_response = recv_hyperdeck_message(sock, timeout=2.0)
+            token = parse_hyperdeck_info(prepare_response).get("token", "")
+
+            if not token:
+                match = re.search(r"216\s+format\s+ready:\s*(\S+)", prepare_response, re.IGNORECASE)
+                token = match.group(1) if match else ""
+
+            if not token:
+                return False, prepare_response.strip() or "Deck nevrátil potvrzovací token."
+
+            sock.sendall((f"format: confirm: {token}\r\n").encode("ascii"))
+            confirm_response = recv_hyperdeck_message(sock, timeout=5.0)
+
+            mounted, slot_response = wait_for_slot_mounted(sock)
+
+            if not mounted:
+                detail = confirm_response.strip() or slot_response
+                return False, detail
+
+            return True, slot_response
+
+    except OSError as e:
+        return False, str(e)
+
+
+def get_format_slot_status(ip, expected_format="1080p50", slot_id=1):
+    ip = normalize_ipv4(ip, "", allow_empty=True)
+
+    if not ip:
+        return "---", "sd-empty"
+
+    try:
+        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
+            recv_hyperdeck_message(sock, timeout=0.4)
+
+            default_standard = expected_format
+            try:
+                sock.sendall(b"configuration\r\n")
+                configuration_response = recv_hyperdeck_message(sock, timeout=0.7)
+                configuration_info = parse_hyperdeck_info(configuration_response)
+                default_standard = configuration_info.get("default standard", "") or expected_format
+            except OSError:
+                default_standard = expected_format
+
+            sock.sendall(f"slot info: slot id: {slot_id}\r\n".encode("ascii"))
+            slot_response = recv_hyperdeck_message(sock, timeout=1.0)
+
+    except OSError:
+        return "---", "sd-empty"
+
+    return slot_response_to_remaining_time(
+        slot_response,
+        default_standard,
+        expected_format
+    )
+
+
 def send_hyperdeck_commands_parallel(decks, cmd):
     results = []
 
@@ -751,11 +1090,11 @@ def send_hyperdeck_commands_parallel(decks, cmd):
     return results
 
 
-def get_hyperdeck_timecode_input(deck):
+def get_hyperdeck_configuration_info(deck):
     ip = deck.get("ip", "").strip()
 
     if not ip:
-        return "---"
+        return {}
 
     try:
         with socket.create_connection((ip, 9993), timeout=0.35) as sock:
@@ -765,9 +1104,13 @@ def get_hyperdeck_timecode_input(deck):
             response = recv_hyperdeck_message(sock, timeout=0.7)
 
     except OSError:
-        return "---"
+        return {}
 
-    info = parse_hyperdeck_info(response)
+    return parse_hyperdeck_info(response)
+
+
+def get_hyperdeck_timecode_input(deck):
+    info = get_hyperdeck_configuration_info(deck)
 
     value = info.get("timecode input", "").strip().lower()
 
@@ -775,6 +1118,16 @@ def get_hyperdeck_timecode_input(deck):
         return value
 
     return "---"
+
+
+def get_hyperdeck_video_input(deck):
+    info = get_hyperdeck_configuration_info(deck)
+    value = info.get("video input", "").strip()
+
+    if not value:
+        return "---"
+
+    return value.upper()
 
 
 def resume_status_pollers():
@@ -817,6 +1170,91 @@ def get_tc_input_map(cfg):
             result[i] = "---"
 
     return result
+
+
+def get_video_input_map(cfg):
+    result = {}
+
+    for i, deck in enumerate(cfg.get("decks", [])):
+        result[i] = get_hyperdeck_video_input(deck)
+
+    return result
+
+
+def get_configuration_info_map(cfg):
+    result = {}
+    decks = cfg.get("decks", [])
+    jobs = []
+
+    for i, deck in enumerate(decks):
+        if deck.get("ip", "").strip():
+            jobs.append((i, deck))
+        else:
+            result[i] = {}
+
+    if not jobs:
+        return result
+
+    max_workers = min(len(jobs), 12)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(get_hyperdeck_configuration_info, deck): index
+            for index, deck in jobs
+        }
+
+        for future in as_completed(future_map):
+            index = future_map[future]
+
+            try:
+                result[index] = future.result()
+            except Exception:
+                result[index] = {}
+
+    return result
+
+
+def configuration_timecode_input(info):
+    value = info.get("timecode input", "").strip().lower()
+
+    if value in TC_INPUT_VALUES:
+        return value
+
+    return "---"
+
+
+def configuration_video_input(info):
+    value = info.get("video input", "").strip()
+
+    if not value:
+        return "---"
+
+    return value.upper()
+
+
+def configuration_video_codec(info):
+    value = info.get("file format", "").strip()
+
+    if not value:
+        return "---"
+
+    if value.lower().startswith("quicktime"):
+        value = value[len("QuickTime"):]
+
+    return value or "---"
+
+
+def configuration_audio_channels(info):
+    codec = info.get("audio codec", "").strip()
+    channels = info.get("audio input channels", "").strip()
+
+    if not channels:
+        return "---"
+
+    if codec:
+        return f"{codec.upper()} {channels}"
+
+    return channels
 
 
 def set_hyperdeck_timecode_input(deck, tc_input):
@@ -936,7 +1374,6 @@ def make_rows(cfg):
     for i, deck in enumerate(cfg["decks"]):
         raw_name = deck.get("name", "")
         name = html.escape(raw_name)
-        ip = html.escape(deck.get("ip", ""))
 
         pgm = is_control_room_deck(cfg, i)
         armed = deck_is_armed_at_index(cfg, i, deck)
@@ -951,11 +1388,19 @@ def make_rows(cfg):
 
         row_class = " ".join(row_classes)
 
-        status_text, led_class, format_text, tc, tc_valid, total_frames = status_map.get(
+        status = status_map.get(
             i,
             get_skipped_state()
         )
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status[:6]
+        sd1, sd2 = (normalize_sd_state(item) for item in status[6:8])
+        sd1_text, sd1_class = sd1
+        sd2_text, sd2_class = sd2
         format_html = html.escape(format_text or "---")
+        sd1_html = html.escape(sd1_text or "---")
+        sd2_html = html.escape(sd2_text or "---")
+        sd1_class_html = html.escape(sd1_class, quote=True)
+        sd2_class_html = html.escape(sd2_class, quote=True)
         format_class = "format" if format_is_ok(format_text, expected_format) else "format format-warning"
         tc_warning = tc_compare["by_index"].get(i, {}).get("warning", False)
         tc_class = "tc tc-warning" if tc_warning else "tc"
@@ -967,8 +1412,9 @@ def make_rows(cfg):
 
         rows += f"""
 <tr class="{row_class}" data-deck-index="{i}">
-  <td class="ip">{ip}</td>
   <td class="name">{name}</td>
+  <td class="sd {sd1_class_html}" data-role="sd1">{sd1_html}</td>
+  <td class="sd {sd2_class_html}" data-role="sd2">{sd2_html}</td>
   <td>
     <form class="inline-form" method="POST" action="/action">
       <input type="hidden" name="deck" value="{i}">
@@ -997,9 +1443,9 @@ def make_settings_rows(cfg, load_tc_inputs=False):
     rows = ""
 
     if load_tc_inputs:
-        tc_inputs = get_tc_input_map(cfg)
+        configuration_info = get_configuration_info_map(cfg)
     else:
-        tc_inputs = {}
+        configuration_info = {}
 
     for i, deck in enumerate(cfg["decks"]):
         raw_name = deck.get("name", "")
@@ -1007,7 +1453,12 @@ def make_settings_rows(cfg, load_tc_inputs=False):
         ip = html.escape(deck.get("ip", ""), quote=True)
         control_room = is_control_room_deck(cfg, i)
         row_class = "pgm-row" if control_room else ""
-        current_tc = tc_inputs.get(i, "---")
+        armed = deck_is_armed_at_index(cfg, i, deck)
+        deck_configuration = configuration_info.get(i, {}) if armed else {}
+        current_tc = configuration_timecode_input(deck_configuration)
+        current_input = html.escape(configuration_video_input(deck_configuration) if armed else "---", quote=True)
+        current_codec = html.escape(configuration_video_codec(deck_configuration) if armed else "---", quote=True)
+        current_audio_channels = html.escape(configuration_audio_channels(deck_configuration) if armed else "---", quote=True)
         tc_select = make_tc_input_select(i, current_tc)
 
         if control_room:
@@ -1033,6 +1484,9 @@ def make_settings_rows(cfg, load_tc_inputs=False):
     {tc_select}
     <input type="hidden" name="deck_tc_original_{i}" value="{html.escape(current_tc, quote=True)}">
   </td>
+  <td class="input-display">{current_input}</td>
+  <td class="input-display">{current_codec}</td>
+  <td class="input-display">{current_audio_channels}</td>
 </tr>
 """
 
@@ -1054,15 +1508,15 @@ h1{margin:0;font-size:30px;letter-spacing:2px;white-space:nowrap}
 .topnav{display:flex;justify-content:center;align-items:center;gap:12px}
 .navbtn{border:1px solid #444;border-radius:10px;padding:10px 22px;background:#242432;color:#eee;font-size:18px;font-weight:bold;cursor:pointer}
 .navbtn.active{background:#1b6cff;border-color:#7dabff;box-shadow:0 0 14px #1b6cff}
+.advanced-btn{display:none}
+body.settings-page .advanced-btn{display:inline-block}
 .close-panel-btn{width:44px;height:44px;min-width:44px;padding:0;border:1px solid #5d2222;border-radius:4px;background:#3a1515;color:#fff;font-size:26px;font-weight:bold;line-height:1;cursor:pointer}
 .close-panel-btn:hover{background:#7a0000;border-color:#ff6666;box-shadow:0 0 12px rgba(255,75,75,.55)}
 .notice{
-  position:fixed !important;
-  top:14px !important;
-  right:18px !important;
-  z-index:99999 !important;
-  margin:0 !important;
-  padding:8px 14px !important;
+  display:block;
+  width:fit-content;
+  margin:8px auto 6px auto !important;
+  padding:6px 14px !important;
   border-radius:10px !important;
   background:#113b20 !important;
   color:#78ff9c !important;
@@ -1089,17 +1543,23 @@ th,td{padding:8px 10px;border-bottom:1px solid #33333d;text-align:center;font-si
 tr:last-child td{border-bottom:none}
 th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;background:#1d1d28}
 /* column layout start */
-.decks-table th:nth-child(1),.decks-table td:nth-child(1){width:14%}
-.decks-table th:nth-child(2),.decks-table td:nth-child(2){width:13%}
-.decks-table th:nth-child(3),.decks-table td:nth-child(3){width:12%}
-.decks-table th:nth-child(4),.decks-table td:nth-child(4){width:12%}
-.decks-table th:nth-child(5),.decks-table td:nth-child(5){width:18%}
-.decks-table th:nth-child(6),.decks-table td:nth-child(6){width:13%}
-.decks-table th:nth-child(7),.decks-table td:nth-child(7){width:18%}
-.settings-table th:nth-child(1),.settings-table td:nth-child(1){width:10%}
-.settings-table th:nth-child(2),.settings-table td:nth-child(2){width:31%}
-.settings-table th:nth-child(3),.settings-table td:nth-child(3){width:31%}
-.settings-table th:nth-child(4),.settings-table td:nth-child(4){width:28%}
+.decks-table th:nth-child(1),.decks-table td:nth-child(1){width:12%}
+.decks-table th:nth-child(2),.decks-table td:nth-child(2){width:9%}
+.decks-table th:nth-child(3),.decks-table td:nth-child(3){width:9%}
+.decks-table th:nth-child(4),.decks-table td:nth-child(4){width:10%}
+.decks-table th:nth-child(5),.decks-table td:nth-child(5){width:10%}
+.decks-table th:nth-child(6),.decks-table td:nth-child(6){width:17%}
+.decks-table th:nth-child(7),.decks-table td:nth-child(7){width:12%}
+.decks-table th:nth-child(8),.decks-table td:nth-child(8){width:21%}
+.settings-table th:nth-child(1),.settings-table td:nth-child(1){width:6%}
+.settings-table th:nth-child(2),.settings-table td:nth-child(2){width:18%}
+.settings-table th:nth-child(3),.settings-table td:nth-child(3){width:18%}
+.settings-table th:nth-child(4),.settings-table td:nth-child(4){width:18%}
+.settings-table th:nth-child(5),.settings-table td:nth-child(5){width:12%}
+.settings-table th:nth-child(6),.settings-table td:nth-child(6){width:16%}
+.settings-table th:nth-child(7),.settings-table td:nth-child(7){width:12%}
+.settings-table th,.settings-table td{border:1px solid #777!important}
+.settings-form .panel-card{width:70%;margin-left:auto;margin-right:auto}
 /* column layout end */
 
 
@@ -1109,11 +1569,19 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 
 .arm-cell{width:auto;padding-left:82px;padding-right:52px;text-align:center}
 .settings-table .arm-cell{padding-left:6px;padding-right:6px}
+.input-display{font-family:monospace;font-size:16px;color:#d8d8e4;font-weight:bold}
 .arm-form{margin:0}
 .arm-check{width:24px;height:24px;cursor:pointer;vertical-align:-5px}
 .always-arm{font-size:14px;font-weight:bold;color:#78ff9c;letter-spacing:1px}
 .name{font-weight:bold;text-align:center;font-size:23px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ip{color:#b8b8c0;font-size:16px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sd{font-family:monospace;font-size:21px;color:#78ff9c;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sd.sd-empty{color:#d8d8e4!important;font-weight:normal;text-shadow:none}
+.sd-warning{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45)}
+.sd-full{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45);animation:sdFullBlink 1s steps(2,start) infinite}
+@keyframes sdFullBlink{50%{opacity:.18}}
+.sd-work{color:#ffd24a!important;font-weight:bold;text-shadow:0 0 10px rgba(255,210,74,.45);animation:sdWorkBlink 1.8s steps(2,start) infinite}
+@keyframes sdWorkBlink{50%{opacity:.35}}
 .tc{font-family:monospace;font-size:29px;letter-spacing:1px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tc-warning{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45)}
 .format{font-family:monospace;font-size:21px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1140,12 +1608,26 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .logger-frame{width:100%;height:calc(100vh - 116px);border:1px solid #444;border-radius:12px;background:#000}
 .logger-note{text-align:center;color:#aaa;margin-bottom:8px;font-size:15px}
 .settings-note{margin-top:14px;text-align:center;color:#aaa;font-size:18px}
-.settings-form{max-width:760px;margin:0 auto}
+.settings-form{width:100%;max-width:none;margin:0 auto}
 .settings-form table{margin-top:10px}
+.settings-field-row{display:grid;grid-template-columns:190px minmax(100px,17%);align-items:center;gap:10px;margin-top:8px}
+.settings-field-row:first-child{margin-top:0}
+.settings-field-row .small-label{margin:0;text-align:right}
+.settings-field-row.format-row{grid-template-columns:190px minmax(100px,17%) max-content 78px}
+.format-btn{background:#49495a;color:#fff;border:1px solid #69697a;border-radius:8px;padding:9px 16px;font-size:15px;font-weight:bold;cursor:pointer;white-space:nowrap}
+.format-btn:hover{background:#5a5a6d;border-color:#8a8aa0}
+.format-btn:disabled{opacity:.55;cursor:wait}
+.format-slot-status{text-align:center}
+.settings-inline-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:70%;margin:26px auto 24px auto;box-sizing:border-box}
+.settings-inline-item{display:grid;grid-template-columns:max-content minmax(78px,40%);align-items:center;justify-content:start;gap:8px}
+.settings-inline-item .small-label{margin:0;text-align:left;font-family:monospace;font-size:16px;font-weight:bold}
+.settings-inline-item .text-input{font-family:monospace;font-size:16px;font-weight:bold}
+.settings-inline-item.wide-control{grid-template-columns:max-content minmax(78px,40%)}
 .text-input{width:100%;background:#0f0f15;color:#eee;border:1px solid #555;border-radius:8px;padding:10px 12px;font-size:22px}
 .name-input{font-weight:bold}
 .ip-input{font-family:monospace;text-align:center}
-.save-row{display:flex;justify-content:center;gap:24px;margin-top:20px}
+.settings-table .name-input,.settings-table .ip-input{width:50%;display:block;margin:0 auto}
+.save-row{display:flex;justify-content:center;gap:24px;margin-top:42px}
 .save-btn{background:#1b6cff;width:260px;height:62px;font-size:26px;border-radius:14px}
 .small-label{color:#aaa;font-size:15px;margin-bottom:6px;text-align:center}
 .settings-switch-row{display:flex;justify-content:center;gap:28px;margin:14px 0}
@@ -1163,7 +1645,8 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 
 /* compact settings start */
 .settings-form{
-  max-width:720px !important;
+  width:100% !important;
+  max-width:none !important;
   margin:0 auto !important;
   font-size:13px !important;
 }
@@ -1189,6 +1672,43 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
   box-sizing:border-box !important;
 }
 
+.settings-field-row{
+  grid-template-columns:160px minmax(90px,17%) !important;
+  gap:8px !important;
+  margin-top:4px !important;
+}
+
+.settings-field-row.format-row{
+  grid-template-columns:160px minmax(90px,17%) max-content 70px !important;
+}
+
+.settings-inline-row{
+  gap:10px !important;
+  width:70% !important;
+  margin:22px auto 22px auto !important;
+  box-sizing:border-box !important;
+}
+
+.settings-inline-item{
+  gap:6px !important;
+}
+
+.settings-inline-item.wide-control{
+  grid-template-columns:max-content minmax(78px,40%) !important;
+}
+
+.settings-inline-item .text-input{
+  font-family:monospace !important;
+  font-size:16px !important;
+  font-weight:bold !important;
+}
+
+.settings-inline-item .small-label{
+  font-family:monospace !important;
+  font-size:16px !important;
+  font-weight:bold !important;
+}
+
 .settings-switch-row{
   margin:4px 0 !important;
   gap:12px !important;
@@ -1202,7 +1722,7 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 }
 
 .save-row{
-  margin-top:6px !important;
+  margin-top:26px !important;
   gap:12px !important;
 }
 
@@ -1291,11 +1811,11 @@ body.initial-settings .settings-panel {
       <button id="btnDecks" class="navbtn active" onclick="window.location.href='/'">HYPERDECK</button>
       <button id="btnLogger" class="navbtn" onclick="window.location.href='/atem'">ATEM LOGGER</button>
       <button id="btnSettings" class="navbtn" onclick="window.location.href='/settings'">SETTINGS</button>
+      <button id="btnAdvanced" class="navbtn advanced-btn" type="button" onclick="window.location.href='/advanced'">ADVANCED</button>
       <button class="close-panel-btn" type="button" title="Zavřít panel" onclick="closePanel()">×</button>
     </div>
   </div>
 
-  __NOTICE__
   __ALARM__
 
   <div id="viewDecks" class="view active">
@@ -1303,8 +1823,9 @@ body.initial-settings .settings-panel {
       <table class="decks-table">
         <thead>
           <tr>
-            <th>IP</th>
             <th>Deck</th>
+            <th>SD1</th>
+            <th>SD2</th>
             <th>Rec</th>
             <th>Stop</th>
             <th>Status</th>
@@ -1338,31 +1859,6 @@ body.initial-settings .settings-panel {
 
   <div id="viewSettings" class="view">
     <form class="settings-form" method="POST" action="/save-settings">
-      <div class="small-label">HYPERDECK CONTROL IP</div>
-      <input class="text-input ip-input" type="text" name="panel_ip" value="__PANEL_IP__">
-
-      <div class="small-label" style="margin-top:12px;">ATEM LOGGER IP</div>
-      <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
-
-      <div class="small-label" style="margin-top:12px;">FORMÁT</div>
-      <input class="text-input ip-input" type="text" name="expected_format" value="__EXPECTED_FORMAT__">
-
-      <div class="small-label" style="margin-top:12px;">REFERENCE TC</div>
-      <select class="text-input ip-input" name="tc_reference_mode">
-        <option value="group" __TC_REF_GROUP_SELECTED__>Skupina</option>
-        <option value="control_room" __TC_REF_CONTROL_ROOM_SELECTED__>Režie</option>
-      </select>
-
-      <div class="settings-switch-row">
-        <label class="check-label">
-          <input type="checkbox" name="tc_compare" value="1" __TC_COMPARE_CHECKED__>
-          TC COMPARE
-        </label>
-      </div>
-
-      <div class="small-label">TC TOLERANCE FRAMES</div>
-      <input class="text-input ip-input" type="number" min="0" max="50" name="tc_tolerance_frames" value="__TC_TOLERANCE_FRAMES__">
-
       <div class="panel-card">
         <table class="settings-table">
           <thead>
@@ -1371,6 +1867,9 @@ body.initial-settings .settings-panel {
               <th>Deck name</th>
               <th>IP address</th>
               <th>TC IN</th>
+              <th>V INPUT</th>
+              <th>V CODEC</th>
+              <th>AUDIO</th>
             </tr>
           </thead>
           <tbody>
@@ -1379,12 +1878,77 @@ body.initial-settings .settings-panel {
         </table>
       </div>
 
+      <div class="settings-inline-row">
+        <div class="settings-inline-item wide-control">
+          <div class="small-label">FORMÁT</div>
+          <input class="text-input ip-input" type="text" name="expected_format" value="__EXPECTED_FORMAT__">
+        </div>
+
+        <div class="settings-inline-item">
+          <div class="small-label">TC COMPARE</div>
+          <select class="text-input ip-input" name="tc_compare">
+            <option value="yes" __TC_COMPARE_YES_SELECTED__>Ano</option>
+            <option value="no" __TC_COMPARE_NO_SELECTED__>Ne</option>
+          </select>
+        </div>
+
+        <div class="settings-inline-item">
+          <div class="small-label">TC REFERENCE</div>
+          <select class="text-input ip-input" name="tc_reference_mode">
+            <option value="group" __TC_REF_GROUP_SELECTED__>Skupina</option>
+            <option value="control_room" __TC_REF_CONTROL_ROOM_SELECTED__>Režie</option>
+          </select>
+        </div>
+
+        <div class="settings-inline-item">
+          <div class="small-label">TC TOL. FRAMES</div>
+          <input class="text-input ip-input" type="number" min="0" max="50" name="tc_tolerance_frames" value="__TC_TOLERANCE_FRAMES__">
+        </div>
+      </div>
+
+      __NOTICE__
+
+      <div class="save-row">
+        <button class="btn save-btn" type="submit">ULOŽIT</button>
+      </div>
+
+    </form>
+  </div>
+
+  <div id="viewAdvanced" class="view">
+    <form class="settings-form" method="POST" action="/save-advanced">
+      <div class="settings-field-row">
+        <div class="small-label">DECK CONTROL IP</div>
+        <input class="text-input ip-input" type="text" name="panel_ip" value="__PANEL_IP__">
+      </div>
+
+      <div class="settings-field-row">
+        <div class="small-label">ATEM LOGGER IP</div>
+        <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
+      </div>
+
+      <div class="settings-field-row format-row">
+        <div class="small-label">FORMAT IP HD MINI</div>
+        <input class="text-input ip-input" type="text" name="format_ip_hd_mini" value="__FORMAT_IP_HD_MINI__">
+        <button id="hdMiniFormatBtn" class="format-btn" type="button" onclick="formatHdMiniSlot1()">FORMATING HD MINI</button>
+        <div id="hdMiniSlot1Status" class="sd sd-empty format-slot-status">---</div>
+      </div>
+
+      <div class="settings-field-row format-row">
+        <div class="small-label">FORMAT IP 4K Pro</div>
+        <input class="text-input ip-input" type="text" name="format_ip_4k_pro" value="__FORMAT_IP_4K_PRO__">
+        <button id="format4kProBtn" class="format-btn" type="button" onclick="format4kProSlot1()">FORMATING 4K Pro</button>
+        <div id="format4kProSlot1Status" class="sd sd-empty format-slot-status">---</div>
+      </div>
+
+      __NOTICE__
+
       <div class="save-row">
         <button class="btn save-btn" type="submit">ULOŽIT</button>
       </div>
 
       <div class="settings-note">
-        Pozor: HYPERDECK CONTROL IP mění zatím jen hodnotu uloženou v konfiguraci panelu.
+        Pozor: DECK CONTROL IP mění zatím jen hodnotu uloženou v konfiguraci panelu.
         Skutečná IP adresa Raspberry se nastavuje v systému.
       </div>
     </form>
@@ -1408,6 +1972,160 @@ async function closePanel() {
   }
 }
 
+async function formatHdMiniSlot1() {
+  formatSlot1("hdMini");
+}
+
+async function format4kProSlot1() {
+  formatSlot1("format4kPro");
+}
+
+const formatDevices = {
+  hdMini: {
+    label: "HD Mini",
+    ip: "__FORMAT_IP_HD_MINI__",
+    formatUrl: "/api/format-hd-mini-slot1",
+    statusUrl: "/api/format-hd-mini-slot1-status",
+    buttonId: "hdMiniFormatBtn",
+    statusId: "hdMiniSlot1Status",
+    busy: false,
+    working: false
+  },
+  format4kPro: {
+    label: "4K Pro",
+    ip: "__FORMAT_IP_4K_PRO__",
+    formatUrl: "/api/format-4k-pro-slot1",
+    statusUrl: "/api/format-4k-pro-slot1-status",
+    buttonId: "format4kProBtn",
+    statusId: "format4kProSlot1Status",
+    busy: false,
+    working: false
+  }
+};
+
+let formatStatusTimer = null;
+
+function setFormatWorking(device, active) {
+  const statusEl = document.getElementById(device.statusId);
+  const button = document.getElementById(device.buttonId);
+
+  device.working = active;
+
+  if (button) {
+    button.disabled = active;
+  }
+
+  if (!statusEl) {
+    return;
+  }
+
+  statusEl.classList.toggle("sd-work", active);
+
+  if (active) {
+    statusEl.textContent = "WORK...";
+    statusEl.classList.remove("sd-empty", "sd-warning", "sd-full");
+  }
+}
+
+async function formatSlot1(deviceKey) {
+  const device = formatDevices[deviceKey];
+
+  if (!device) {
+    return;
+  }
+
+  const ok = confirm(`Opravdu FORMÁTOVAT kartu v ${device.label}?\\n\\nIP: ${device.ip}\\nSlot: 1\\nFilesystem: exFAT\\n\\nTato akce smaže obsah karty.`);
+
+  if (!ok) {
+    return;
+  }
+
+  setFormatWorking(device, true);
+
+  try {
+    const response = await fetch(device.formatUrl, {
+      method: "POST",
+      cache: "no-store"
+    });
+    const result = await response.json();
+
+    setFormatWorking(device, false);
+    alert(result.message || (result.ok ? "Formátování hotovo." : "Formátování selhalo."));
+    updateFormatSlot1Status(deviceKey);
+  } catch (err) {
+    alert("Formátování selhalo: " + err);
+    setFormatWorking(device, false);
+  }
+}
+
+async function updateFormatSlot1Status(deviceKey) {
+  const device = formatDevices[deviceKey];
+
+  if (!device) {
+    return;
+  }
+
+  const el = document.getElementById(device.statusId);
+
+  if (!el || device.busy) {
+    return;
+  }
+
+  device.busy = true;
+
+  try {
+    const response = await fetch(device.statusUrl, {
+      method: "GET",
+      cache: "no-store"
+    });
+    const status = await response.json();
+
+    if (device.working) {
+      return;
+    }
+
+    el.textContent = status.text || "---";
+    el.classList.remove("sd-work");
+    el.classList.toggle("sd-empty", !!status.empty || el.textContent === "---");
+    el.classList.toggle("sd-warning", !!status.warning);
+    el.classList.toggle("sd-full", !!status.full);
+  } catch (err) {
+    if (device.working) {
+      return;
+    }
+
+    el.textContent = "---";
+    el.classList.add("sd-empty");
+    el.classList.remove("sd-warning", "sd-full", "sd-work");
+  } finally {
+    device.busy = false;
+  }
+}
+
+function updateAllFormatSlotStatuses() {
+  updateFormatSlot1Status("hdMini");
+  updateFormatSlot1Status("format4kPro");
+}
+
+function startFormatStatusPolling() {
+  updateAllFormatSlotStatuses();
+
+  if (formatStatusTimer) {
+    return;
+  }
+
+  formatStatusTimer = setInterval(updateAllFormatSlotStatuses, 2000);
+}
+
+function stopFormatStatusPolling() {
+  if (!formatStatusTimer) {
+    return;
+  }
+
+  clearInterval(formatStatusTimer);
+  formatStatusTimer = null;
+}
+
 function addActive(id) {
   const el = document.getElementById(id);
   if (el) {
@@ -1426,6 +2144,7 @@ function showView(name) {
   // remove initial settings class start
   if (document.body) {
     document.body.classList.remove("initial-settings");
+    document.body.classList.toggle("settings-page", name === "settings" || name === "advanced");
   }
   // remove initial settings class end
   // pause status polling in settings start
@@ -1440,13 +2159,21 @@ function showView(name) {
   }
   // pause status polling in settings end
 
+  if (name === "advanced") {
+    startFormatStatusPolling();
+  } else {
+    stopFormatStatusPolling();
+  }
+
   removeActive("viewDecks");
   removeActive("viewLogger");
   removeActive("viewSettings");
+  removeActive("viewAdvanced");
 
   removeActive("btnDecks");
   removeActive("btnLogger");
   removeActive("btnSettings");
+  removeActive("btnAdvanced");
 
   if (name === "decks") {
     addActive("viewDecks");
@@ -1461,6 +2188,11 @@ function showView(name) {
   if (name === "settings") {
     addActive("viewSettings");
     addActive("btnSettings");
+  }
+
+  if (name === "advanced") {
+    addActive("viewAdvanced");
+    addActive("btnAdvanced");
   }
 }
 
@@ -1539,6 +2271,26 @@ function applyStatusData(data) {
       led.className = `led ${deck.led}`;
       statusCell.appendChild(led);
       statusCell.appendChild(document.createTextNode(` ${deck.status}`));
+    }
+
+    const sd1Cell = row.querySelector('[data-role="sd1"]');
+
+    if (sd1Cell) {
+      sd1Cell.textContent = deck.sd1 || "---";
+      const sd1Empty = !!deck.sd1_empty || (sd1Cell.textContent === "---" && !deck.sd1_warning && !deck.sd1_full);
+      sd1Cell.classList.toggle("sd-empty", sd1Empty);
+      sd1Cell.classList.toggle("sd-warning", !!deck.sd1_warning);
+      sd1Cell.classList.toggle("sd-full", !!deck.sd1_full);
+    }
+
+    const sd2Cell = row.querySelector('[data-role="sd2"]');
+
+    if (sd2Cell) {
+      sd2Cell.textContent = deck.sd2 || "---";
+      const sd2Empty = !!deck.sd2_empty || (sd2Cell.textContent === "---" && !deck.sd2_warning && !deck.sd2_full);
+      sd2Cell.classList.toggle("sd-empty", sd2Empty);
+      sd2Cell.classList.toggle("sd-warning", !!deck.sd2_warning);
+      sd2Cell.classList.toggle("sd-full", !!deck.sd2_full);
     }
 
     const formatCell = row.querySelector('[data-role="format"]');
@@ -1631,15 +2383,6 @@ if (statusPollingAllowedByUrl()) {
 }
 // controlled status polling end
 
-setTimeout(() => {
-  const notice = document.querySelector(".notice");
-
-  if (notice) {
-    notice.style.display = "none";
-    window.history.replaceState({}, document.title, "/");
-  }
-}, 2500);
-
 // view from url start
 (function() {
   const path = window.location.pathname;
@@ -1653,6 +2396,11 @@ setTimeout(() => {
 
   if (path === "/atem" || view === "logger") {
     showView("logger");
+    return;
+  }
+
+  if (path === "/advanced" || view === "advanced") {
+    showView("advanced");
     return;
   }
 
@@ -1693,6 +2441,10 @@ setTimeout(() => {
 })();
 // saved toast end
 
+if (document.getElementById("hdMiniSlot1Status")) {
+  startFormatStatusPolling();
+}
+
 </script>
 </body>
 </html>
@@ -1710,10 +2462,14 @@ def build_status_api():
         if not deck_is_armed_at_index(cfg, i, deck):
             continue
 
-        status_text, led_class, format_text, tc, tc_valid, total_frames = status_map.get(
+        status = status_map.get(
             i,
             get_skipped_state()
         )
+        status_text, led_class, format_text, tc, tc_valid, total_frames = status[:6]
+        sd1, sd2 = (normalize_sd_state(item) for item in status[6:8])
+        sd1_text, sd1_class = sd1
+        sd2_text, sd2_class = sd2
         tc_info = tc_compare["by_index"].get(i, {})
 
         decks_out.append({
@@ -1724,6 +2480,14 @@ def build_status_api():
             "led": led_class,
             "format": format_text,
             "format_ok": format_is_ok(format_text, expected_format),
+            "sd1": sd1_text,
+            "sd1_empty": sd1_class == "sd-empty",
+            "sd1_warning": sd1_class == "sd-warning",
+            "sd1_full": sd1_class == "sd-full",
+            "sd2": sd2_text,
+            "sd2_empty": sd2_class == "sd-empty",
+            "sd2_warning": sd2_class == "sd-warning",
+            "sd2_full": sd2_class == "sd-full",
             "tc": tc,
             "tc_valid": bool(tc_valid),
             "tc_warning": bool(tc_info.get("warning", False)),
@@ -1735,6 +2499,23 @@ def build_status_api():
     return {
         "alarm_html": make_alarm(cfg, status_map=status_map),
         "decks": decks_out
+    }
+
+
+def build_format_slot_status_payload(nvm_key):
+    cfg = load_config()
+    advanced_nvm = load_advanced_nvm()
+    text, css_class = get_format_slot_status(
+        advanced_nvm.get(nvm_key, ""),
+        expected_format=cfg.get("expected_format", "1080p50"),
+        slot_id=1
+    )
+
+    return {
+        "text": text,
+        "empty": css_class == "sd-empty",
+        "warning": css_class == "sd-warning",
+        "full": css_class == "sd-full"
     }
 
 
@@ -1778,45 +2559,57 @@ def add_initial_settings_class(match):
     tag = match.group(0)
 
     if 'class="' in tag:
-        return re.sub(r'class="([^"]*)"', r'class="\1 initial-settings"', tag, count=1)
+        return re.sub(r'class="([^"]*)"', r'class="\1 initial-settings settings-page"', tag, count=1)
 
     if "class='" in tag:
-        return re.sub(r"class='([^']*)'", r"class='\1 initial-settings'", tag, count=1)
+        return re.sub(r"class='([^']*)'", r"class='\1 initial-settings settings-page'", tag, count=1)
 
-    return tag[:-1] + ' class="initial-settings">'
+    return tag[:-1] + ' class="initial-settings settings-page">'
 
 
 def apply_real_page_split(page, initial_view):
     deck_match = re.search(r'\n\s*<div id="viewDecks"[^>]*>', page)
     logger_match = re.search(r'\n\s*<div id="viewLogger"[^>]*>', page)
     settings_match = re.search(r'\n\s*<div id="viewSettings"[^>]*>', page)
+    advanced_match = re.search(r'\n\s*<div id="viewAdvanced"[^>]*>', page)
     footer_match = re.search(r'\n\s*<div class="footer"', page)
 
-    if not (deck_match and logger_match and settings_match and footer_match):
+    if not (deck_match and logger_match and settings_match and advanced_match and footer_match):
         return page
 
     deck_pos = deck_match.start()
     logger_pos = logger_match.start()
     settings_pos = settings_match.start()
+    advanced_pos = advanced_match.start()
     footer_pos = footer_match.start()
 
-    if not (deck_pos < logger_pos < settings_pos < footer_pos):
+    if not (deck_pos < logger_pos < settings_pos < advanced_pos < footer_pos):
         return page
 
     before_views = page[:deck_pos]
     deck_block = page[deck_pos:logger_pos]
     logger_block = page[logger_pos:settings_pos]
-    settings_block = page[settings_pos:footer_pos]
+    settings_block = page[settings_pos:advanced_pos]
+    advanced_block = page[advanced_pos:footer_pos]
     after_views = page[footer_pos:]
 
     def clear_active_buttons(text):
         text = re.sub(r'id="btnDecks" class="navbtn(?: active)?"', 'id="btnDecks" class="navbtn"', text)
         text = re.sub(r'id="btnLogger" class="navbtn(?: active)?"', 'id="btnLogger" class="navbtn"', text)
         text = re.sub(r'id="btnSettings" class="navbtn(?: active)?"', 'id="btnSettings" class="navbtn"', text)
+        text = re.sub(r'id="btnAdvanced" class="navbtn advanced-btn(?: active)?"', 'id="btnAdvanced" class="navbtn advanced-btn"', text)
         return text
 
     def set_button_active(text, button_id):
         text = clear_active_buttons(text)
+
+        if button_id == "btnAdvanced":
+            return text.replace(
+                'id="btnAdvanced" class="navbtn advanced-btn"',
+                'id="btnAdvanced" class="navbtn advanced-btn active"',
+                1
+            )
+
         return text.replace(
             f'id="{button_id}" class="navbtn"',
             f'id="{button_id}" class="navbtn active"',
@@ -1825,7 +2618,7 @@ def apply_real_page_split(page, initial_view):
 
     def set_view_active(block):
         return re.sub(
-            r'<div id="(viewDecks|viewLogger|viewSettings)" class="view(?: active)?"',
+            r'<div id="(viewDecks|viewLogger|viewSettings|viewAdvanced)" class="view(?: active)?"',
             r'<div id="\1" class="view active"',
             block,
             count=1
@@ -1839,6 +2632,10 @@ def apply_real_page_split(page, initial_view):
         before_views = set_button_active(before_views, "btnLogger")
         return before_views + set_view_active(logger_block) + after_views
 
+    if initial_view == "advanced":
+        before_views = set_button_active(before_views, "btnAdvanced")
+        return before_views + set_view_active(advanced_block) + after_views
+
     before_views = set_button_active(before_views, "btnDecks")
     return before_views + set_view_active(deck_block) + after_views
 
@@ -1846,6 +2643,7 @@ def apply_real_page_split(page, initial_view):
 
 def build_page(saved=False, initial_view="hyperdeck"):
     cfg = load_config()
+    advanced_nvm = load_advanced_nvm()
 
     if initial_view == "hyperdeck":
         resume_status_pollers()
@@ -1863,7 +2661,8 @@ def build_page(saved=False, initial_view="hyperdeck"):
     if saved:
         notice = '<div class="notice">Nastavení uloženo.</div>'
 
-    tc_compare_checked = "checked" if cfg.get("tc_compare", True) else ""
+    tc_compare_yes_selected = "selected" if cfg.get("tc_compare", True) else ""
+    tc_compare_no_selected = "" if cfg.get("tc_compare", True) else "selected"
     tc_tolerance_frames = html.escape(str(cfg.get("tc_tolerance_frames", 2)))
     tc_reference_mode = normalize_tc_reference_mode(cfg.get("tc_reference_mode", "group"))
     tc_ref_group_selected = "selected" if tc_reference_mode == "group" else ""
@@ -1877,7 +2676,7 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__ATEM_LOGGER_URL__", f"http://{atem_logger_ip}/")
 
     # initial settings body class start
-    if initial_view == "settings":
+    if initial_view in ("settings", "advanced"):
         page = re.sub(
             r"<body([^>]*)>",
             add_initial_settings_class,
@@ -1895,10 +2694,13 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__SETTINGS_ROWS__", make_settings_rows(cfg, load_tc_inputs=(initial_view == "settings")))
     page = page.replace("__PANEL_IP__", panel_ip)
     page = page.replace("__ATEM_LOGGER_IP__", atem_logger_ip)
+    page = page.replace("__FORMAT_IP_HD_MINI__", html.escape(advanced_nvm.get("format_ip_hd_mini", ""), quote=True))
+    page = page.replace("__FORMAT_IP_4K_PRO__", html.escape(advanced_nvm.get("format_ip_4k_pro", ""), quote=True))
     page = page.replace("__EXPECTED_FORMAT__", expected_format)
     page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
-    page = page.replace("__TC_COMPARE_CHECKED__", tc_compare_checked)
+    page = page.replace("__TC_COMPARE_YES_SELECTED__", tc_compare_yes_selected)
+    page = page.replace("__TC_COMPARE_NO_SELECTED__", tc_compare_no_selected)
     page = page.replace("__TC_TOLERANCE_FRAMES__", tc_tolerance_frames)
     page = page.replace("__STATUS_POLL_ENABLED__", status_poll_enabled)
 
@@ -1921,9 +2723,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        format_status_paths = {
+            "/api/format-hd-mini-slot1-status": "format_ip_hd_mini",
+            "/api/format-4k-pro-slot1-status": "format_ip_4k_pro"
+        }
+
+        if parsed.path in format_status_paths:
+            payload = json.dumps(
+                build_format_slot_status_payload(format_status_paths[parsed.path]),
+                ensure_ascii=False
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         saved = "saved=1" in parsed.query
 
-        initial_view = "settings" if (parsed.path == "/settings" or "view=settings" in parsed.query) else ("logger" if (parsed.path == "/atem" or "view=logger" in parsed.query) else "hyperdeck")
+        initial_view = "settings" if (parsed.path == "/settings" or "view=settings" in parsed.query) else ("advanced" if (parsed.path == "/advanced" or "view=advanced" in parsed.query) else ("logger" if (parsed.path == "/atem" or "view=logger" in parsed.query) else "hyperdeck"))
 
 
         page = build_page(saved=saved, initial_view=initial_view).encode("utf-8")
@@ -1945,6 +2766,31 @@ class Handler(BaseHTTPRequestHandler):
             }, ensure_ascii=False).encode("utf-8")
 
             self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        format_action_paths = {
+            "/api/format-hd-mini-slot1": ("format_ip_hd_mini", "HD Mini"),
+            "/api/format-4k-pro-slot1": ("format_ip_4k_pro", "4K Pro")
+        }
+
+        if self.path in format_action_paths:
+            nvm_key, device_label = format_action_paths[self.path]
+            advanced_nvm = load_advanced_nvm()
+            ip = advanced_nvm.get(nvm_key, "")
+            ok, response = format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT")
+            message = f"Formátování {device_label} slot 1 hotovo." if ok else f"Formátování {device_label} selhalo: {response}\nNení karta zamčená?"
+            payload = json.dumps({
+                "ok": ok,
+                "message": message,
+                "response": response
+            }, ensure_ascii=False).encode("utf-8")
+
+            self.send_response(200 if ok else 500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
@@ -1999,6 +2845,59 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if self.path == "/save-advanced":
+            cfg = load_config()
+            advanced_nvm = load_advanced_nvm()
+
+            panel_ip = form.get(
+                "panel_ip",
+                [cfg.get("panel_ip", "10.0.0.8")]
+            )[0].strip()
+
+            cfg["panel_ip"] = normalize_ipv4(
+                panel_ip,
+                cfg.get("panel_ip", "10.0.0.8")
+            )
+
+            atem_logger_ip = form.get(
+                "atem_logger_ip",
+                [cfg.get("atem_logger_ip", "10.0.0.9")]
+            )[0].strip()
+
+            cfg["atem_logger_ip"] = normalize_ipv4(
+                atem_logger_ip,
+                cfg.get("atem_logger_ip", "10.0.0.9")
+            )
+
+            save_config(cfg)
+
+            format_ip_hd_mini = form.get(
+                "format_ip_hd_mini",
+                [advanced_nvm.get("format_ip_hd_mini", "")]
+            )[0].strip()
+            format_ip_4k_pro = form.get(
+                "format_ip_4k_pro",
+                [advanced_nvm.get("format_ip_4k_pro", "")]
+            )[0].strip()
+
+            advanced_nvm["format_ip_hd_mini"] = normalize_ipv4(
+                format_ip_hd_mini,
+                advanced_nvm.get("format_ip_hd_mini", ""),
+                allow_empty=True
+            )
+            advanced_nvm["format_ip_4k_pro"] = normalize_ipv4(
+                format_ip_4k_pro,
+                advanced_nvm.get("format_ip_4k_pro", ""),
+                allow_empty=True
+            )
+
+            save_advanced_nvm(advanced_nvm)
+
+            self.send_response(303)
+            self.send_header("Location", "/advanced?saved=1")
+            self.end_headers()
+            return
+
         if self.path == "/save-settings":
             cfg = load_config()
 
@@ -2036,7 +2935,8 @@ class Handler(BaseHTTPRequestHandler):
 
             cfg["tc_reference_mode"] = normalize_tc_reference_mode(tc_reference_mode)
 
-            cfg["tc_compare"] = "tc_compare" in form
+            tc_compare_value = form.get("tc_compare", ["yes"])[0].strip().lower()
+            cfg["tc_compare"] = tc_compare_value not in ("no", "0", "false", "off")
 
             try:
                 tolerance = int(form.get(
