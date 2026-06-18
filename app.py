@@ -10,6 +10,7 @@ import copy
 import os
 import ipaddress
 import signal
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
@@ -37,14 +38,19 @@ DEFAULT_CONFIG = {
         {"name": "Cam 8", "ip": "10.0.0.22"},
         {"name": "Cam 9", "ip": ""},
         {"name": "Cam 10", "ip": ""},
+        {"name": "Cam 11", "ip": ""},
+        {"name": "Cam 12", "ip": ""},
         {"name": "Režie", "ip": "10.0.0.24"}
     ]
 }
 
 DEFAULT_ADVANCED_NVM = {
     "format_ip_hd_mini": "",
-    "format_ip_4k_pro": ""
+    "format_ip_4k_pro": "",
+    "deck_video_formats": []
 }
+
+VIDEO_FORMAT_VALUES = ("1080p50", "2160p50")
 
 
 def transport_response_to_state(response):
@@ -85,6 +91,16 @@ def transport_response_to_state(response):
         return status_text, led_class, format_text, "--:--:--:--", False, 0
 
     return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
+
+
+def transport_response_to_active_slot(response):
+    info = parse_hyperdeck_info(response)
+    slot_id = info.get("slot id", "").strip().lower()
+
+    if slot_id in ("1", "2"):
+        return int(slot_id)
+
+    return None
 
 
 def format_video_rate(format_text):
@@ -247,11 +263,11 @@ STATUS_TRANSPORT_TIMEOUT = 0.7
 
 
 def get_skipped_state():
-    return ("SKIPPED", "skipped", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"))
+    return ("SKIPPED", "skipped", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"), None)
 
 
 def get_offline_state():
-    return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"))
+    return ("OFFLINE", "offline", "---", "--:--:--:--", False, 0, ("---", "sd-empty"), ("---", "sd-empty"), None)
 
 
 def make_status_cache_entry(state):
@@ -349,9 +365,10 @@ def status_poller_loop(index, ip, expected_format, stop_event):
         sock.sendall(b"transport info\r\n")
         response = recv_hyperdeck_message(sock, timeout=STATUS_TRANSPORT_TIMEOUT)
         state = transport_response_to_state(response)
+        active_slot = transport_response_to_active_slot(response)
         sd1 = read_slot_remaining_time(sock, 1)
         sd2 = read_slot_remaining_time(sock, 2)
-        return state + (sd1, sd2)
+        return state + (sd1, sd2, active_slot)
 
     while not stop_event.is_set():
         try:
@@ -394,11 +411,11 @@ def ensure_status_pollers(cfg):
     if STATUS_POLLERS_PAUSED:
         return
     decks = cfg.get("decks", [])
-    expected_format = normalize_format(cfg.get("expected_format", "1080p50"))
+    deck_video_formats = get_deck_video_formats(cfg)
     desired = {
         i: {
             "ip": deck.get("ip", "").strip(),
-            "expected_format": expected_format,
+            "expected_format": deck_video_formats[i],
         }
         for i, deck in enumerate(decks)
         if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip()
@@ -655,6 +672,43 @@ def normalize_format(value, fallback="1080p50"):
     return value.lower()
 
 
+def normalize_video_format_choice(value, fallback="1080p50"):
+    value = normalize_format(value, fallback)
+
+    if value in VIDEO_FORMAT_VALUES:
+        return value
+
+    return fallback
+
+
+def get_deck_video_formats(cfg, nvm=None):
+    if nvm is None:
+        nvm = load_advanced_nvm()
+
+    fallback = "1080p50"
+    stored = nvm.get("deck_video_formats", [])
+
+    if not isinstance(stored, list):
+        stored = []
+
+    stored = [
+        normalize_video_format_choice(value, fallback)
+        for value in stored
+    ]
+
+    while len(stored) < len(cfg.get("decks", [])):
+        insert_index = max(0, len(stored) - 1)
+        stored.insert(insert_index, fallback)
+
+    formats = []
+
+    for index, _deck in enumerate(cfg.get("decks", [])):
+        value = stored[index] if index < len(stored) else fallback
+        formats.append(normalize_video_format_choice(value, fallback))
+
+    return formats
+
+
 def format_is_ok(format_text, expected_format="1080p50"):
     expected = normalize_format(expected_format)
     return (format_text or "").strip().lower() == expected
@@ -716,21 +770,83 @@ def load_advanced_nvm():
             loaded = {}
 
         if isinstance(loaded, dict):
-            data.update({
-                key: str(loaded.get(key, value)).strip()
-                for key, value in DEFAULT_ADVANCED_NVM.items()
-            })
+            data["format_ip_hd_mini"] = str(loaded.get("format_ip_hd_mini", "")).strip()
+            data["format_ip_4k_pro"] = str(loaded.get("format_ip_4k_pro", "")).strip()
+
+            deck_video_formats = loaded.get("deck_video_formats", [])
+
+            if isinstance(deck_video_formats, list):
+                data["deck_video_formats"] = [
+                    normalize_video_format_choice(value)
+                    for value in deck_video_formats
+                ]
 
     return data
 
 
 def save_advanced_nvm(data):
     nvm = copy.deepcopy(DEFAULT_ADVANCED_NVM)
-    nvm.update({
-        key: str(data.get(key, value)).strip()
-        for key, value in DEFAULT_ADVANCED_NVM.items()
-    })
+    nvm["format_ip_hd_mini"] = str(data.get("format_ip_hd_mini", "")).strip()
+    nvm["format_ip_4k_pro"] = str(data.get("format_ip_4k_pro", "")).strip()
+    deck_video_formats = data.get("deck_video_formats", [])
+
+    if isinstance(deck_video_formats, list):
+        nvm["deck_video_formats"] = [
+            normalize_video_format_choice(value)
+            for value in deck_video_formats
+        ]
+
     save_json_atomic(ADVANCED_NVM_FILE, nvm)
+
+
+def get_system_network_interfaces():
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=1.0
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    interfaces = []
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+
+        if len(parts) < 4:
+            continue
+
+        name = parts[1]
+        address = parts[3].split("/", 1)[0]
+
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+
+        if ip.version == 4:
+            interfaces.append((name, str(ip)))
+
+    return interfaces
+
+
+def make_network_interfaces_html():
+    interfaces = get_system_network_interfaces()
+
+    if not interfaces:
+        return '<div class="network-interface">ETH: ---</div>'
+
+    items = []
+
+    for name, ip in interfaces:
+        label = html.escape(name)
+        value = html.escape(ip)
+        items.append(f'<div class="network-interface"><span>{label}</span> {value}</div>')
+
+    return "".join(items)
 
 
 def load_config():
@@ -750,6 +866,7 @@ def load_config():
     cfg.setdefault("tc_compare", True)
     cfg.setdefault("tc_tolerance_frames", 2)
     cfg.setdefault("decks", copy.deepcopy(DEFAULT_CONFIG["decks"]))
+    normalize_deck_list(cfg)
 
     for index, deck in enumerate(cfg["decks"]):
         deck.setdefault("armed", True)
@@ -758,6 +875,24 @@ def load_config():
             deck["armed"] = True
 
     return cfg
+
+
+def normalize_deck_list(cfg):
+    decks = cfg.get("decks", [])
+    default_decks = copy.deepcopy(DEFAULT_CONFIG["decks"])
+    target_count = len(default_decks)
+
+    if not isinstance(decks, list) or not decks:
+        cfg["decks"] = default_decks
+        return
+
+    while len(decks) < target_count:
+        insert_index = max(0, len(decks) - 1)
+        default_deck = copy.deepcopy(default_decks[insert_index])
+        default_deck["armed"] = False
+        decks.insert(insert_index, default_deck)
+
+    cfg["decks"] = decks
 
 
 def is_control_room_deck(cfg, index):
@@ -805,6 +940,15 @@ def get_active_count_text(cfg):
 
     control_room_count = 1 if decks else 0
     return f"{active_cameras}+{control_room_count}"
+
+
+def get_active_recorders_label(cfg):
+    return f"ACTIVE REC: {get_active_count_text(cfg).replace('+', ' + ')}"
+
+
+def get_active_recorders_html(cfg):
+    count = html.escape(get_active_count_text(cfg).replace("+", " + "))
+    return f'ACTIVE REC: <span class="active-rec-value">{count}</span>'
 
 
 def frames_to_tcx2(total_frames, fps=25):
@@ -1315,9 +1459,27 @@ def make_tc_input_select(index, current_value="---"):
     )
 
 
-def make_alarm(cfg, status_map=None):
+def make_video_format_select(index, current_value="1080p50"):
+    current_value = normalize_video_format_choice(current_value)
+    options = []
+
+    for value in VIDEO_FORMAT_VALUES:
+        selected = " selected" if value == current_value else ""
+        options.append(f'<option value="{value}"{selected}>{value}</option>')
+
+    return (
+        f'<select class="select-input tc-select" name="deck_video_format_{index}">'
+        + "".join(options)
+        + '</select>'
+    )
+
+
+def make_alarm(cfg, status_map=None, show_active_recorders=False):
+    active_recorders = get_active_recorders_html(cfg)
+
     if not cfg.get("tc_compare", True):
-        return '<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">TC COMPARE OFF</div>'
+        ok_text = active_recorders if show_active_recorders else f"{active_recorders} | TC COMPARE OFF"
+        return f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">{ok_text}</div>'
 
     if status_map is None:
         status_map = get_status_map(cfg)
@@ -1328,7 +1490,8 @@ def make_alarm(cfg, status_map=None):
         return '<div id="tcAlarm" class="alarm" style="display:block;">TC REFERENCE INVALID – Režie nemá platný TC</div>'
 
     if not tc_compare["reference"]:
-        return '<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">REAL MODE – není co porovnávat</div>'
+        ok_text = active_recorders if show_active_recorders else f"{active_recorders} | REAL MODE – nothing to compare"
+        return f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">{ok_text}</div>'
 
     if tc_compare["bad"]:
         parts = []
@@ -1359,14 +1522,14 @@ def make_alarm(cfg, status_map=None):
 
     return (
         f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">'
-        f'REAL MODE – TC OK | tolerance {tolerance}f'
+        f'{active_recorders if show_active_recorders else f"{active_recorders} | REAL MODE – TC OK | tolerance {tolerance}f"}'
         f'</div>'
     )
 
 
 def make_rows(cfg):
     rows = ""
-    expected_format = cfg.get("expected_format", "1080p50")
+    deck_video_formats = get_deck_video_formats(cfg)
 
     status_map = get_status_map(cfg)
     tc_compare = build_tc_compare(cfg, status_map)
@@ -1396,11 +1559,17 @@ def make_rows(cfg):
         sd1, sd2 = (normalize_sd_state(item) for item in status[6:8])
         sd1_text, sd1_class = sd1
         sd2_text, sd2_class = sd2
+        active_slot = status[8] if len(status) > 8 else None
         format_html = html.escape(format_text or "---")
         sd1_html = html.escape(sd1_text or "---")
         sd2_html = html.escape(sd2_text or "---")
         sd1_class_html = html.escape(sd1_class, quote=True)
         sd2_class_html = html.escape(sd2_class, quote=True)
+        if active_slot == 1:
+            sd1_class_html = (sd1_class_html + " sd-active").strip()
+        elif active_slot == 2:
+            sd2_class_html = (sd2_class_html + " sd-active").strip()
+        expected_format = deck_video_formats[i]
         format_class = "format" if format_is_ok(format_text, expected_format) else "format format-warning"
         tc_warning = tc_compare["by_index"].get(i, {}).get("warning", False)
         tc_class = "tc tc-warning" if tc_warning else "tc"
@@ -1413,8 +1582,8 @@ def make_rows(cfg):
         rows += f"""
 <tr class="{row_class}" data-deck-index="{i}">
   <td class="name">{name}</td>
-  <td class="sd {sd1_class_html}" data-role="sd1">{sd1_html}</td>
-  <td class="sd {sd2_class_html}" data-role="sd2">{sd2_html}</td>
+  <td class="sd"><span class="sd-box {sd1_class_html}" data-role="sd1">{sd1_html}</span></td>
+  <td class="sd"><span class="sd-box {sd2_class_html}" data-role="sd2">{sd2_html}</span></td>
   <td>
     <form class="inline-form" method="POST" action="/action">
       <input type="hidden" name="deck" value="{i}">
@@ -1441,6 +1610,7 @@ def make_rows(cfg):
 
 def make_settings_rows(cfg, load_tc_inputs=False):
     rows = ""
+    deck_video_formats = get_deck_video_formats(cfg)
 
     if load_tc_inputs:
         configuration_info = get_configuration_info_map(cfg)
@@ -1460,6 +1630,7 @@ def make_settings_rows(cfg, load_tc_inputs=False):
         current_codec = html.escape(configuration_video_codec(deck_configuration) if armed else "---", quote=True)
         current_audio_channels = html.escape(configuration_audio_channels(deck_configuration) if armed else "---", quote=True)
         tc_select = make_tc_input_select(i, current_tc)
+        video_format_select = make_video_format_select(i, deck_video_formats[i])
 
         if control_room:
             arm_cell = '<td class="arm-cell always-arm"></td>'
@@ -1483,6 +1654,9 @@ def make_settings_rows(cfg, load_tc_inputs=False):
   <td>
     {tc_select}
     <input type="hidden" name="deck_tc_original_{i}" value="{html.escape(current_tc, quote=True)}">
+  </td>
+  <td>
+    {video_format_select}
   </td>
   <td class="input-display">{current_input}</td>
   <td class="input-display">{current_codec}</td>
@@ -1535,6 +1709,7 @@ body.settings-page .advanced-btn{display:inline-block}
 }
 .alarm{display:none;margin-bottom:10px;padding:10px;border-radius:10px;background:#7a0000;color:#fff;text-align:center;font-size:24px;font-weight:bold;box-shadow:0 0 18px #f33}
 .alarm-ok{background:#113b20;color:#78ff9c;box-shadow:0 0 14px #008d35}
+.active-rec-value{color:#fff;font-weight:900;text-shadow:0 0 10px rgba(255,255,255,.55)}
 .view{display:none}
 .view.active{display:block}
 .panel-card{background:#15151d;border:1px solid #33333d;border-radius:12px;overflow:hidden}
@@ -1552,13 +1727,23 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .decks-table th:nth-child(7),.decks-table td:nth-child(7){width:12%}
 .decks-table th:nth-child(8),.decks-table td:nth-child(8){width:21%}
 .settings-table th:nth-child(1),.settings-table td:nth-child(1){width:6%}
-.settings-table th:nth-child(2),.settings-table td:nth-child(2){width:18%}
-.settings-table th:nth-child(3),.settings-table td:nth-child(3){width:18%}
-.settings-table th:nth-child(4),.settings-table td:nth-child(4){width:18%}
-.settings-table th:nth-child(5),.settings-table td:nth-child(5){width:12%}
-.settings-table th:nth-child(6),.settings-table td:nth-child(6){width:16%}
-.settings-table th:nth-child(7),.settings-table td:nth-child(7){width:12%}
-.settings-table th,.settings-table td{border:1px solid #777!important}
+.settings-table th:nth-child(2),.settings-table td:nth-child(2){width:16%}
+.settings-table th:nth-child(3),.settings-table td:nth-child(3){width:16%}
+.settings-table th:nth-child(4),.settings-table td:nth-child(4){width:14%}
+.settings-table th:nth-child(5),.settings-table td:nth-child(5){width:13%}
+.settings-table th:nth-child(6),.settings-table td:nth-child(6){width:11%}
+.settings-table th:nth-child(7),.settings-table td:nth-child(7){width:14%}
+.settings-table th:nth-child(8),.settings-table td:nth-child(8){width:10%}
+.settings-table th{padding:8px 10px;font-size:16px;line-height:1.25}
+.settings-table th,
+.settings-table td,
+.settings-table input,
+.settings-table select,
+.settings-table .input-display{
+  font-family:Arial,sans-serif;
+  font-size:20px;
+  font-weight:600;
+}
 .settings-form .panel-card{width:70%;margin-left:auto;margin-right:auto}
 /* column layout end */
 
@@ -1575,8 +1760,10 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .always-arm{font-size:14px;font-weight:bold;color:#78ff9c;letter-spacing:1px}
 .name{font-weight:bold;text-align:center;font-size:23px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ip{color:#b8b8c0;font-size:16px;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sd{font-family:monospace;font-size:21px;color:#78ff9c;width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sd.sd-empty{color:#d8d8e4!important;font-weight:normal;text-shadow:none}
+.sd{width:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sd-box{display:inline-flex;align-items:center;justify-content:center;width:92%;min-width:76px;height:42px;padding:12px 14px 8px 14px;border-radius:9px;background:rgba(255,255,255,.035);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);font-family:monospace;font-size:21px;line-height:1;color:#78ff9c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sd-active{background:rgba(120,255,156,.12);box-shadow:inset 0 0 0 1px rgba(120,255,156,.28), inset 0 0 18px rgba(120,255,156,.10)}
+.sd-empty{color:#d8d8e4!important;font-weight:normal;text-shadow:none}
 .sd-warning{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45)}
 .sd-full{color:#ff4b4b!important;font-weight:bold;text-shadow:0 0 10px rgba(255,75,75,.45);animation:sdFullBlink 1s steps(2,start) infinite}
 @keyframes sdFullBlink{50%{opacity:.18}}
@@ -1608,25 +1795,41 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .logger-frame{width:100%;height:calc(100vh - 116px);border:1px solid #444;border-radius:12px;background:#000}
 .logger-note{text-align:center;color:#aaa;margin-bottom:8px;font-size:15px}
 .settings-note{margin-top:14px;text-align:center;color:#aaa;font-size:18px}
+.network-interfaces{display:flex;justify-content:center;align-items:center;gap:18px;margin-top:20px;color:#d8d8e4;font-family:Arial,sans-serif;font-size:18px;font-weight:600}
+.network-interface{padding:7px 14px;border:1px solid #444;border-radius:8px;background:#0f0f15;white-space:nowrap}
+.network-interface span{color:#78ff9c}
 .settings-form{width:100%;max-width:none;margin:0 auto}
 .settings-form table{margin-top:10px}
 .settings-field-row{display:grid;grid-template-columns:190px minmax(100px,17%);align-items:center;gap:10px;margin-top:8px}
 .settings-field-row:first-child{margin-top:0}
 .settings-field-row .small-label{margin:0;text-align:right}
 .settings-field-row.format-row{grid-template-columns:190px minmax(100px,17%) max-content 78px}
-.format-btn{background:#49495a;color:#fff;border:1px solid #69697a;border-radius:8px;padding:9px 16px;font-size:15px;font-weight:bold;cursor:pointer;white-space:nowrap}
+.format-btn{background:#49495a;color:#ff4b4b;border:1px solid #69697a;border-radius:8px;padding:9px 16px;font-size:15px;font-weight:bold;cursor:pointer;white-space:nowrap}
 .format-btn:hover{background:#5a5a6d;border-color:#8a8aa0}
 .format-btn:disabled{opacity:.55;cursor:wait}
 .format-slot-status{text-align:center}
-.settings-inline-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:70%;margin:26px auto 24px auto;box-sizing:border-box}
-.settings-inline-item{display:grid;grid-template-columns:max-content minmax(78px,40%);align-items:center;justify-content:start;gap:8px}
-.settings-inline-item .small-label{margin:0;text-align:left;font-family:monospace;font-size:16px;font-weight:bold}
-.settings-inline-item .text-input{font-family:monospace;font-size:16px;font-weight:bold}
-.settings-inline-item.wide-control{grid-template-columns:max-content minmax(78px,40%)}
+.settings-inline-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:36px;width:70%;margin:26px auto 24px auto;box-sizing:border-box}
+.settings-inline-item{display:grid;grid-template-columns:max-content minmax(92px,1fr);align-items:center;justify-content:stretch;gap:8px}
+.settings-inline-item .small-label{margin:0;text-align:left;font-family:Arial,sans-serif;font-size:20px;font-weight:600}
+.settings-inline-item .text-input{font-family:Arial,sans-serif;font-size:20px;font-weight:600;height:34px;padding:4px 6px}
+.settings-inline-item.wide-control{grid-template-columns:max-content minmax(92px,1fr)}
 .text-input{width:100%;background:#0f0f15;color:#eee;border:1px solid #555;border-radius:8px;padding:10px 12px;font-size:22px}
 .name-input{font-weight:bold}
 .ip-input{font-family:monospace;text-align:center}
-.settings-table .name-input,.settings-table .ip-input{width:50%;display:block;margin:0 auto}
+.settings-table .name-input,.settings-table .ip-input{width:82%;display:block;margin:0 auto}
+.settings-table .ip-input,.settings-table .tc-select{text-align:center}
+.settings-table select,
+.settings-inline-item select{
+  background:#0f0f15;
+  color:#eee;
+  border:1px solid #555;
+  border-radius:8px;
+}
+.settings-table select option,
+.settings-inline-item select option{
+  background:#0f0f15;
+  color:#eee;
+}
 .save-row{display:flex;justify-content:center;gap:24px;margin-top:42px}
 .save-btn{background:#1b6cff;width:260px;height:62px;font-size:26px;border-radius:14px}
 .small-label{color:#aaa;font-size:15px;margin-bottom:6px;text-align:center}
@@ -1662,14 +1865,37 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
   line-height:1.15 !important;
 }
 
-.settings-form input[type="text"],
+.settings-table th{
+  padding:9px 6px !important;
+  font-size:15px !important;
+  line-height:1.15 !important;
+}
+
+.settings-form input[type="text"]:not(.name-input):not(.ip-input),
 .settings-form select,
-.settings-form .text-input{
+.settings-form .text-input:not(.name-input):not(.ip-input){
   font-size:13px !important;
   padding:3px 6px !important;
   min-height:24px !important;
   height:26px !important;
   box-sizing:border-box !important;
+}
+
+.settings-table th,
+.settings-table td,
+.settings-table input,
+.settings-table select,
+.settings-table .input-display{
+  font-family:Arial,sans-serif !important;
+  font-size:20px !important;
+  font-weight:600 !important;
+}
+
+.settings-table input,
+.settings-table select{
+  height:34px !important;
+  padding:4px 6px !important;
+  line-height:1.2 !important;
 }
 
 .settings-field-row{
@@ -1683,30 +1909,58 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 }
 
 .settings-inline-row{
-  gap:10px !important;
+  gap:36px !important;
   width:70% !important;
   margin:22px auto 22px auto !important;
   box-sizing:border-box !important;
 }
 
 .settings-inline-item{
+  grid-template-columns:max-content minmax(92px,1fr) !important;
   gap:6px !important;
 }
 
 .settings-inline-item.wide-control{
-  grid-template-columns:max-content minmax(78px,40%) !important;
+  grid-template-columns:max-content minmax(92px,1fr) !important;
 }
 
 .settings-inline-item .text-input{
-  font-family:monospace !important;
-  font-size:16px !important;
-  font-weight:bold !important;
+  font-family:Arial,sans-serif !important;
+  font-size:20px !important;
+  font-weight:600 !important;
+  height:34px !important;
+  padding:4px 6px !important;
+  line-height:1.2 !important;
 }
 
 .settings-inline-item .small-label{
-  font-family:monospace !important;
-  font-size:16px !important;
-  font-weight:bold !important;
+  font-family:Arial,sans-serif !important;
+  font-size:20px !important;
+  font-weight:600 !important;
+}
+
+.settings-table select,
+.settings-inline-item select{
+  background:#0f0f15 !important;
+  color:#eee !important;
+  border:1px solid #555 !important;
+  border-radius:8px !important;
+}
+
+.settings-table select option,
+.settings-inline-item select option{
+  background:#0f0f15 !important;
+  color:#eee !important;
+}
+
+.settings-table .name-input,
+.settings-table .ip-input{
+  font-family:Arial,sans-serif !important;
+  font-size:20px !important;
+  font-weight:600 !important;
+  line-height:1.2 !important;
+  height:34px !important;
+  padding:4px 6px !important;
 }
 
 .settings-switch-row{
@@ -1721,9 +1975,26 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
   line-height:1.15 !important;
 }
 
+.network-interfaces{
+  margin-top:20px !important;
+  gap:12px !important;
+  font-size:15px !important;
+}
+
+.network-interface{
+  padding:5px 10px !important;
+}
+
 .save-row{
   margin-top:26px !important;
   gap:12px !important;
+}
+
+#viewSettings .save-row{
+  width:70% !important;
+  margin-left:auto !important;
+  margin-right:auto !important;
+  justify-content:flex-end !important;
 }
 
 .save-btn{
@@ -1867,6 +2138,7 @@ body.initial-settings .settings-panel {
               <th>Deck name</th>
               <th>IP address</th>
               <th>TC IN</th>
+              <th>V FORMAT</th>
               <th>V INPUT</th>
               <th>V CODEC</th>
               <th>AUDIO</th>
@@ -1918,26 +2190,21 @@ body.initial-settings .settings-panel {
   <div id="viewAdvanced" class="view">
     <form class="settings-form" method="POST" action="/save-advanced">
       <div class="settings-field-row">
-        <div class="small-label">DECK CONTROL IP</div>
-        <input class="text-input ip-input" type="text" name="panel_ip" value="__PANEL_IP__">
-      </div>
-
-      <div class="settings-field-row">
         <div class="small-label">ATEM LOGGER IP</div>
         <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
       </div>
 
       <div class="settings-field-row format-row">
-        <div class="small-label">FORMAT IP HD MINI</div>
+        <div class="small-label">HD Mini Format IP</div>
         <input class="text-input ip-input" type="text" name="format_ip_hd_mini" value="__FORMAT_IP_HD_MINI__">
-        <button id="hdMiniFormatBtn" class="format-btn" type="button" onclick="formatHdMiniSlot1()">FORMATING HD MINI</button>
+        <button id="hdMiniFormatBtn" class="format-btn" type="button" onclick="formatHdMiniSlot1()">FORMAT HD MINI</button>
         <div id="hdMiniSlot1Status" class="sd sd-empty format-slot-status">---</div>
       </div>
 
       <div class="settings-field-row format-row">
-        <div class="small-label">FORMAT IP 4K Pro</div>
+        <div class="small-label">4K Pro Format IP</div>
         <input class="text-input ip-input" type="text" name="format_ip_4k_pro" value="__FORMAT_IP_4K_PRO__">
-        <button id="format4kProBtn" class="format-btn" type="button" onclick="format4kProSlot1()">FORMATING 4K Pro</button>
+        <button id="format4kProBtn" class="format-btn" type="button" onclick="format4kProSlot1()">FORMAT 4K Pro</button>
         <div id="format4kProSlot1Status" class="sd sd-empty format-slot-status">---</div>
       </div>
 
@@ -1947,10 +2214,10 @@ body.initial-settings .settings-panel {
         <button class="btn save-btn" type="submit">ULOŽIT</button>
       </div>
 
-      <div class="settings-note">
-        Pozor: DECK CONTROL IP mění zatím jen hodnotu uloženou v konfiguraci panelu.
-        Skutečná IP adresa Raspberry se nastavuje v systému.
+      <div class="network-interfaces">
+        __NETWORK_INTERFACES__
       </div>
+
     </form>
   </div>
 
@@ -2281,6 +2548,7 @@ function applyStatusData(data) {
       sd1Cell.classList.toggle("sd-empty", sd1Empty);
       sd1Cell.classList.toggle("sd-warning", !!deck.sd1_warning);
       sd1Cell.classList.toggle("sd-full", !!deck.sd1_full);
+      sd1Cell.classList.toggle("sd-active", !!deck.sd1_active);
     }
 
     const sd2Cell = row.querySelector('[data-role="sd2"]');
@@ -2291,6 +2559,7 @@ function applyStatusData(data) {
       sd2Cell.classList.toggle("sd-empty", sd2Empty);
       sd2Cell.classList.toggle("sd-warning", !!deck.sd2_warning);
       sd2Cell.classList.toggle("sd-full", !!deck.sd2_full);
+      sd2Cell.classList.toggle("sd-active", !!deck.sd2_active);
     }
 
     const formatCell = row.querySelector('[data-role="format"]');
@@ -2453,7 +2722,7 @@ if (document.getElementById("hdMiniSlot1Status")) {
 
 def build_status_api():
     cfg = load_config()
-    expected_format = cfg.get("expected_format", "1080p50")
+    deck_video_formats = get_deck_video_formats(cfg)
     decks_out = []
     status_map = get_status_map(cfg)
     tc_compare = build_tc_compare(cfg, status_map)
@@ -2470,6 +2739,8 @@ def build_status_api():
         sd1, sd2 = (normalize_sd_state(item) for item in status[6:8])
         sd1_text, sd1_class = sd1
         sd2_text, sd2_class = sd2
+        active_slot = status[8] if len(status) > 8 else None
+        expected_format = deck_video_formats[i]
         tc_info = tc_compare["by_index"].get(i, {})
 
         decks_out.append({
@@ -2484,10 +2755,12 @@ def build_status_api():
             "sd1_empty": sd1_class == "sd-empty",
             "sd1_warning": sd1_class == "sd-warning",
             "sd1_full": sd1_class == "sd-full",
+            "sd1_active": active_slot == 1,
             "sd2": sd2_text,
             "sd2_empty": sd2_class == "sd-empty",
             "sd2_warning": sd2_class == "sd-warning",
             "sd2_full": sd2_class == "sd-full",
+            "sd2_active": active_slot == 2,
             "tc": tc,
             "tc_valid": bool(tc_valid),
             "tc_warning": bool(tc_info.get("warning", False)),
@@ -2685,8 +2958,8 @@ def build_page(saved=False, initial_view="hyperdeck"):
         )
     # initial settings body class end
     page = page.replace("__NOTICE__", notice)
-    page = page.replace("__ALARM__", make_alarm(cfg))
-    page = page.replace("__ACTIVE_COUNT__", html.escape(get_active_count_text(cfg)))
+    page = page.replace("__ALARM__", make_alarm(cfg, show_active_recorders=(initial_view == "settings")))
+    page = page.replace("__ACTIVE_COUNT__", "")
     if initial_view == "hyperdeck":
         page = page.replace("__ROWS__", make_rows(cfg))
     else:
@@ -2696,6 +2969,7 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__ATEM_LOGGER_IP__", atem_logger_ip)
     page = page.replace("__FORMAT_IP_HD_MINI__", html.escape(advanced_nvm.get("format_ip_hd_mini", ""), quote=True))
     page = page.replace("__FORMAT_IP_4K_PRO__", html.escape(advanced_nvm.get("format_ip_4k_pro", ""), quote=True))
+    page = page.replace("__NETWORK_INTERFACES__", make_network_interfaces_html())
     page = page.replace("__EXPECTED_FORMAT__", expected_format)
     page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
@@ -2900,6 +3174,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/save-settings":
             cfg = load_config()
+            advanced_nvm = load_advanced_nvm()
 
             panel_ip = form.get(
                 "panel_ip",
@@ -2920,13 +3195,6 @@ class Handler(BaseHTTPRequestHandler):
                 atem_logger_ip,
                 cfg.get("atem_logger_ip", "10.0.0.9")
             )
-
-            expected_format = form.get(
-                "expected_format",
-                [cfg.get("expected_format", "1080p50")]
-            )[0].strip()
-
-            cfg["expected_format"] = normalize_format(expected_format)
 
             tc_reference_mode = form.get(
                 "tc_reference_mode",
@@ -2984,6 +3252,13 @@ class Handler(BaseHTTPRequestHandler):
 
             cfg["decks"] = new_decks
 
+            advanced_nvm["deck_video_formats"] = [
+                normalize_video_format_choice(
+                    form.get(f"deck_video_format_{i}", ["1080p50"])[0]
+                )
+                for i in range(len(new_decks))
+            ]
+
             stop_all_status_pollers(pause_seconds=0.4)
             for i, deck in enumerate(cfg.get("decks", [])):
                 tc_input = form.get(f"deck_tc_input_{i}", [""])[0].strip().lower()
@@ -2996,6 +3271,7 @@ class Handler(BaseHTTPRequestHandler):
                     set_hyperdeck_timecode_input(deck, tc_input)
 
             save_config(cfg)
+            save_advanced_nvm(advanced_nvm)
 
             self.send_response(303)
             self.send_header("Location", "/settings?saved=1")

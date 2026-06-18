@@ -55,6 +55,16 @@
       "armed": false
     },
     {
+      "name": "Cam 11",
+      "ip": "10.0.0.26",
+      "armed": false
+    },
+    {
+      "name": "Cam 12",
+      "ip": "10.0.0.27",
+      "armed": false
+    },
+    {
       "name": "Režie",
       "ip": "10.0.0.24",
       "armed": true
