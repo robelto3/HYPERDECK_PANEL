@@ -260,6 +260,8 @@ FORMAT_LOCKS = {
     "format_ip_hd_mini": threading.Lock(),
     "format_ip_4k_pro": threading.Lock(),
 }
+FORMAT_PROGRESS_LOCK = threading.Lock()
+FORMAT_PROGRESS = {}
 STATUS_POLLERS = {}
 STATUS_POLLERS_PAUSED = False
 STATUS_CACHE = {}
@@ -844,6 +846,10 @@ def get_system_network_interfaces():
 
 def make_network_interfaces_html():
     interfaces = get_system_network_interfaces()
+    interface_labels = {
+        "eth0": "eth0 -> Recorders",
+        "eth1": "eth1 -> Atem Logger",
+    }
 
     if not interfaces:
         return '<div class="network-interface">ETH: ---</div>'
@@ -851,7 +857,7 @@ def make_network_interfaces_html():
     items = []
 
     for name, ip in interfaces:
-        label = html.escape(name)
+        label = html.escape(interface_labels.get(name, name))
         value = html.escape(ip)
         items.append(f'<div class="network-interface"><span>{label}</span> {value}</div>')
 
@@ -952,11 +958,11 @@ def get_active_count_text(cfg):
 
 
 def get_active_recorders_label(cfg):
-    return f"ACTIVE REC: {get_active_count_text(cfg).replace('+', ' + ')}"
+    return f"ACTIVE REC: {get_active_count_text(cfg)}"
 
 
 def get_active_recorders_html(cfg):
-    count = html.escape(get_active_count_text(cfg).replace("+", " + "))
+    count = html.escape(get_active_count_text(cfg))
     return f'ACTIVE REC: <span class="active-rec-value">{count}</span>'
 
 
@@ -1177,6 +1183,35 @@ def format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT"):
 
     except OSError as e:
         return False, str(e)
+
+
+def format_hyperdeck_slots(ip, slot_ids, filesystem="exFAT", progress_key=None):
+    results = []
+
+    for slot_id in slot_ids:
+        if progress_key:
+            with FORMAT_PROGRESS_LOCK:
+                FORMAT_PROGRESS[progress_key] = {
+                    "active": True,
+                    "current_slot": slot_id,
+                    "slots": list(slot_ids),
+                }
+
+        ok, response = format_hyperdeck_slot(
+            ip,
+            slot_id=slot_id,
+            filesystem=filesystem,
+        )
+        results.append({
+            "slot": slot_id,
+            "ok": ok,
+            "response": response,
+        })
+
+        if not ok:
+            break
+
+    return all(item["ok"] for item in results) and len(results) == len(slot_ids), results
 
 
 def get_format_slot_status(ip, expected_format="1080p50", slot_id=1):
@@ -1499,7 +1534,7 @@ def make_alarm(cfg, status_map=None, show_active_recorders=False):
         return '<div id="tcAlarm" class="alarm" style="display:block;">TC REFERENCE INVALID – Režie nemá platný TC</div>'
 
     if not tc_compare["reference"]:
-        ok_text = active_recorders if show_active_recorders else f"{active_recorders} | REAL MODE – nothing to compare"
+        ok_text = active_recorders if show_active_recorders else f"{active_recorders} | nothing to compare"
         return f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">{ok_text}</div>'
 
     if tc_compare["bad"]:
@@ -1517,13 +1552,13 @@ def make_alarm(cfg, status_map=None, show_active_recorders=False):
         if tc_compare.get("ambiguous", False):
             return (
                 f'<div id="tcAlarm" class="alarm" style="display:block;">'
-                f'TC MISMATCH | {msg} | tolerance {tolerance}f'
+                f'TC MISMATCH | {msg} - tolerance {tolerance}f'
                 f'</div>'
             )
 
         return (
             f'<div id="tcAlarm" class="alarm" style="display:block;">'
-            f'TC MISMATCH – reference {html.escape(ref["name"])} | {msg} | tolerance {tolerance}f'
+            f'TC MISMATCH – reference {html.escape(ref["name"])} | {msg} - tolerance {tolerance}f'
             f'</div>'
         )
 
@@ -1531,7 +1566,7 @@ def make_alarm(cfg, status_map=None, show_active_recorders=False):
 
     return (
         f'<div id="tcAlarm" class="alarm alarm-ok" style="display:block;">'
-        f'{active_recorders if show_active_recorders else f"{active_recorders} | REAL MODE – TC OK | tolerance {tolerance}f"}'
+        f'{active_recorders if show_active_recorders else f"{active_recorders} | TC OK - tolerance {tolerance}f"}'
         f'</div>'
     )
 
@@ -1797,6 +1832,10 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .rec:hover{background:#d00030}
 .stop{background:#0057c8}
 .stop:hover{background:#0b6cff}
+.decks-table tbody tr:not(.pgm-row):nth-child(odd) td{background:#111118}
+.decks-table tbody tr:not(.pgm-row):nth-child(even) td{background:#1b1b25}
+.settings-table tbody tr:not(.pgm-row):nth-child(odd) td{background:#111118}
+.settings-table tbody tr:not(.pgm-row):nth-child(even) td{background:#1b1b25}
 .pgm-row td{background:#202018;border-top:3px solid #777746}
 .pgm-row .name::after{content:""}
 .disarmed-row td{color:#777!important;filter:grayscale(1);opacity:.42}
@@ -2058,6 +2097,277 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 }
 /* compact settings end */
 
+/* advanced layout start */
+#viewAdvanced .settings-form{
+  width:min(1180px,94%) !important;
+  margin:18px auto 56px auto !important;
+}
+.advanced-page-intro{
+  margin:0 0 18px 0 !important;
+  color:#a8a8b5;
+  font-size:19px;
+  line-height:1.45;
+  text-align:center;
+}
+.advanced-grid{
+  display:grid;
+  grid-template-columns:minmax(560px,1.6fr) minmax(280px,.8fr);
+  gap:18px;
+  align-items:stretch;
+}
+.advanced-card{
+  min-width:0;
+  padding:22px;
+  border:1px solid #33333d;
+  border-radius:14px;
+  background:#15151d;
+  box-shadow:0 10px 28px rgba(0,0,0,.22);
+}
+.advanced-card-header{
+  margin-bottom:18px;
+  padding-bottom:14px;
+  border-bottom:1px solid #33333d;
+}
+.advanced-card-title{
+  margin:0 0 5px 0 !important;
+  color:#f2f2f6;
+  font-size:26px !important;
+  letter-spacing:.5px;
+}
+.advanced-card-description{
+  margin:0 !important;
+  color:#9696a5;
+  font-size:17px !important;
+  line-height:1.4 !important;
+}
+.advanced-field{
+  display:grid;
+  gap:7px;
+}
+.advanced-field label{
+  color:#c6c6d0;
+  font-size:17px;
+  font-weight:bold;
+  letter-spacing:.5px;
+  text-transform:uppercase;
+}
+#viewAdvanced .advanced-field .text-input{
+  width:100%;
+  height:44px !important;
+  padding:8px 12px !important;
+  border:1px solid #4a4a58;
+  border-radius:9px;
+  background:#0f0f15;
+  color:#fff;
+  font-family:monospace !important;
+  font-size:23px !important;
+  font-weight:bold !important;
+}
+#viewAdvanced .advanced-field .text-input:focus{
+  border-color:#6c9dff;
+  outline:none;
+  box-shadow:0 0 0 3px rgba(27,108,255,.2);
+}
+.network-summary{
+  margin-top:22px;
+  padding-top:16px;
+  border-top:1px solid #2d2d37;
+}
+.network-summary-title{
+  margin-bottom:9px;
+  color:#777786;
+  font-size:14px;
+  font-weight:bold;
+  letter-spacing:1px;
+  text-transform:uppercase;
+}
+#viewAdvanced .network-interfaces{
+  display:grid;
+  gap:8px !important;
+  justify-content:stretch;
+  margin:0 !important;
+  font-size:18px !important;
+}
+#viewAdvanced .network-interface{
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  padding:8px 10px !important;
+  border-radius:8px;
+  background:#101017;
+  font-family:monospace;
+}
+.media-card{
+  border-color:#4a3030;
+  background:linear-gradient(180deg,#19151a 0%,#15151d 100%);
+}
+.media-card .advanced-card-header{
+  border-bottom-color:#4a3030;
+}
+.danger-label{
+  display:inline-block;
+  margin-bottom:7px;
+  padding:4px 8px;
+  border:1px solid #7a3333;
+  border-radius:6px;
+  background:#351616;
+  color:#ff7777;
+  font-size:13px;
+  font-weight:bold;
+  letter-spacing:1px;
+  text-transform:uppercase;
+}
+.format-device-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:14px;
+}
+.format-device-card{
+  display:grid;
+  gap:16px;
+  padding:16px;
+  border:1px solid #3a3a46;
+  border-radius:11px;
+  background:#101017;
+}
+.format-device-name{
+  margin:0;
+  color:#eee;
+  font-size:23px;
+}
+.format-device-actions{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:10px;
+  padding-top:14px;
+  border-top:1px solid #30303a;
+}
+.format-slot-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+.format-slot-block{
+  display:grid;
+  gap:5px;
+}
+.format-slot-label{
+  color:#777786;
+  font-size:14px;
+  font-weight:bold;
+  letter-spacing:.8px;
+  text-transform:uppercase;
+}
+.format-selection-label{
+  color:#777786;
+  font-size:14px;
+  font-weight:bold;
+  letter-spacing:.8px;
+  text-transform:uppercase;
+}
+.format-choice-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:8px;
+}
+.format-choice{
+  display:block;
+  cursor:pointer;
+}
+.format-choice input{
+  position:absolute;
+  opacity:0;
+  pointer-events:none;
+}
+.format-choice span{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  min-height:40px;
+  border:1px solid #494957;
+  border-radius:8px;
+  background:#191920;
+  color:#aaaab6;
+  font-size:17px;
+  font-weight:bold;
+  transition:.15s ease;
+}
+.format-choice input:checked + span{
+  border-color:#d95757;
+  background:#4b1d1d;
+  color:#ff8888;
+  box-shadow:inset 0 0 0 1px rgba(255,105,105,.2);
+}
+.format-choice input:focus-visible + span{
+  outline:2px solid #7dabff;
+  outline-offset:2px;
+}
+.format-choice input:disabled + span{
+  border-color:#303038;
+  background:#131319;
+  color:#555560;
+  box-shadow:none;
+  cursor:not-allowed;
+  opacity:.6;
+}
+#viewAdvanced .format-slot-status{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  min-height:42px;
+  padding:8px 10px;
+  border:1px solid #353542;
+  border-radius:8px;
+  background:#181820;
+  font-family:monospace;
+  font-size:22px;
+  font-weight:bold;
+}
+#viewAdvanced .format-btn{
+  width:100%;
+  min-height:42px;
+  padding:8px 12px;
+  font-size:18px;
+  border-color:#8a3d3d;
+  background:#3a1717;
+  color:#ff6b6b;
+}
+#viewAdvanced .format-btn:hover{
+  border-color:#ff6666;
+  background:#641d1d;
+  box-shadow:0 0 12px rgba(255,75,75,.28);
+}
+.advanced-save-panel{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:24px;
+  margin-top:18px;
+  padding:14px 18px;
+  border:1px solid #33333d;
+  border-radius:12px;
+  background:#15151d;
+}
+.advanced-save-note{
+  color:#a8a8b5;
+  font-size:17px;
+  line-height:1.35;
+}
+#viewAdvanced .save-row{
+  flex:0 0 auto;
+  margin:0 !important;
+}
+#viewAdvanced .save-btn{
+  width:190px !important;
+  height:44px !important;
+  font-size:18px !important;
+}
+@media(max-width:900px){
+  .advanced-grid{grid-template-columns:1fr}
+  .format-device-grid{grid-template-columns:1fr}
+}
+/* advanced layout end */
+
 
 /* initial settings no flash start */
 body.initial-settings #hyperdeckView,
@@ -2106,8 +2416,8 @@ body.initial-settings .settings-panel {
         <thead>
           <tr>
             <th>Deck</th>
-            <th>SD1</th>
-            <th>SD2</th>
+            <th>SLOT 1</th>
+            <th>SLOT 2</th>
             <th>Rec</th>
             <th>Stop</th>
             <th>Status</th>
@@ -2199,33 +2509,98 @@ body.initial-settings .settings-panel {
   <div id="viewAdvanced" class="view">
     <form class="settings-form" method="POST" action="/save-advanced">
       <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
-      <div class="settings-field-row">
-        <div class="small-label">ATEM LOGGER IP</div>
-        <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
-      </div>
+      <p class="advanced-page-intro">Síťová integrace a servisní nástroje panelu.</p>
 
-      <div class="settings-field-row format-row">
-        <div class="small-label">HD Mini Format IP</div>
-        <input class="text-input ip-input" type="text" name="format_ip_hd_mini" value="__FORMAT_IP_HD_MINI__">
-        <button id="hdMiniFormatBtn" class="format-btn" type="button" onclick="formatHdMiniSlot1()">FORMAT HD MINI</button>
-        <div id="hdMiniSlot1Status" class="sd sd-empty format-slot-status">---</div>
-      </div>
+      <div class="advanced-grid">
+        <section class="advanced-card media-card">
+          <div class="advanced-card-header">
+            <span class="danger-label">Pozor – destruktivní operace</span>
+            <h2 class="advanced-card-title">Správa médií</h2>
+            <p class="advanced-card-description">Formátování smaže obsah vybraných médií. Novou IP adresu nejprve uložte.</p>
+          </div>
 
-      <div class="settings-field-row format-row">
-        <div class="small-label">4K Pro Format IP</div>
-        <input class="text-input ip-input" type="text" name="format_ip_4k_pro" value="__FORMAT_IP_4K_PRO__">
-        <button id="format4kProBtn" class="format-btn" type="button" onclick="format4kProSlot1()">FORMAT 4K Pro</button>
-        <div id="format4kProSlot1Status" class="sd sd-empty format-slot-status">---</div>
+          <div class="format-device-grid">
+            <article class="format-device-card">
+              <h3 class="format-device-name">HyperDeck HD Mini</h3>
+              <div class="advanced-field">
+                <label for="formatIpHdMini">IP adresa zařízení</label>
+                <input id="formatIpHdMini" class="text-input ip-input" type="text" name="format_ip_hd_mini" value="__FORMAT_IP_HD_MINI__">
+              </div>
+              <div class="format-slot-grid">
+                <div class="format-slot-block">
+                  <span class="format-slot-label">SD 1 - zbývající čas</span>
+                  <div id="hdMiniSlot1Status" class="sd sd-empty format-slot-status">---</div>
+                </div>
+                <div class="format-slot-block">
+                  <span class="format-slot-label">SD 2 - zbývající čas</span>
+                  <div id="hdMiniSlot2Status" class="sd sd-empty format-slot-status">---</div>
+                </div>
+              </div>
+              <div class="format-device-actions">
+                <span class="format-selection-label">Formátovat</span>
+                <div class="format-choice-grid">
+                  <label class="format-choice"><input id="hdMiniSlot1Choice" type="checkbox" checked onchange="updateFormatButton('hdMini')"><span>SD 1</span></label>
+                  <label class="format-choice"><input id="hdMiniSlot2Choice" type="checkbox" onchange="updateFormatButton('hdMini')"><span>SD 2</span></label>
+                </div>
+                <button id="hdMiniFormatBtn" class="format-btn" type="button" onclick="formatDevice('hdMini')">FORMAT SD 1</button>
+              </div>
+            </article>
+
+            <article class="format-device-card">
+              <h3 class="format-device-name">HyperDeck 4K Pro</h3>
+              <div class="advanced-field">
+                <label for="formatIp4kPro">IP adresa zařízení</label>
+                <input id="formatIp4kPro" class="text-input ip-input" type="text" name="format_ip_4k_pro" value="__FORMAT_IP_4K_PRO__">
+              </div>
+              <div class="format-slot-grid">
+                <div class="format-slot-block">
+                  <span class="format-slot-label">SSD 1 - zbývající čas</span>
+                  <div id="format4kProSlot1Status" class="sd sd-empty format-slot-status">---</div>
+                </div>
+                <div class="format-slot-block">
+                  <span class="format-slot-label">SSD 2 - zbývající čas</span>
+                  <div id="format4kProSlot2Status" class="sd sd-empty format-slot-status">---</div>
+                </div>
+              </div>
+              <div class="format-device-actions">
+                <span class="format-selection-label">Formátovat</span>
+                <div class="format-choice-grid">
+                  <label class="format-choice"><input id="format4kProSlot1Choice" type="checkbox" checked onchange="updateFormatButton('format4kPro')"><span>SSD 1</span></label>
+                  <label class="format-choice"><input id="format4kProSlot2Choice" type="checkbox" onchange="updateFormatButton('format4kPro')"><span>SSD 2</span></label>
+                </div>
+                <button id="format4kProBtn" class="format-btn" type="button" onclick="formatDevice('format4kPro')">FORMAT SSD 1</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="advanced-card">
+          <div class="advanced-card-header">
+            <h2 class="advanced-card-title">Síť a integrace</h2>
+            <p class="advanced-card-description">Připojení externího ATEM loggeru a síťové adresy tohoto panelu.</p>
+          </div>
+
+          <div class="advanced-field">
+            <label for="atemLoggerIp">ATEM Logger IP</label>
+            <input id="atemLoggerIp" class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
+          </div>
+
+          <div class="network-summary">
+            <div class="network-summary-title">Aktivní rozhraní Raspberry Pi</div>
+            <div class="network-interfaces">
+              __NETWORK_INTERFACES__
+            </div>
+          </div>
+        </section>
       </div>
 
       __NOTICE__
 
-      <div class="save-row">
-        <button class="btn save-btn" type="submit">ULOŽIT</button>
-      </div>
-
-      <div class="network-interfaces">
-        __NETWORK_INTERFACES__
+      <div class="advanced-save-panel">
+        <div class="advanced-save-note">Uloží síťové adresy. Změny nemají vliv na probíhající záznam.</div>
+        <div class="save-row">
+          <button class="btn save-btn" type="submit">ULOŽIT ZMĚNY IP</button>
+        </div>
       </div>
 
     </form>
@@ -2252,32 +2627,28 @@ async function closePanel() {
   }
 }
 
-async function formatHdMiniSlot1() {
-  formatSlot1("hdMini");
-}
-
-async function format4kProSlot1() {
-  formatSlot1("format4kPro");
-}
-
 const formatDevices = {
   hdMini: {
     label: "HD Mini",
+    mediaLabel: "SD",
     ip: "__FORMAT_IP_HD_MINI__",
-    formatUrl: "/api/format-hd-mini-slot1",
-    statusUrl: "/api/format-hd-mini-slot1-status",
+    formatUrl: "/api/format-hd-mini",
+    statusUrl: "/api/format-hd-mini-status",
     buttonId: "hdMiniFormatBtn",
-    statusId: "hdMiniSlot1Status",
+    choiceIds: {1: "hdMiniSlot1Choice", 2: "hdMiniSlot2Choice"},
+    statusIds: {1: "hdMiniSlot1Status", 2: "hdMiniSlot2Status"},
     busy: false,
     working: false
   },
   format4kPro: {
     label: "4K Pro",
+    mediaLabel: "SSD",
     ip: "__FORMAT_IP_4K_PRO__",
-    formatUrl: "/api/format-4k-pro-slot1",
-    statusUrl: "/api/format-4k-pro-slot1-status",
+    formatUrl: "/api/format-4k-pro",
+    statusUrl: "/api/format-4k-pro-status",
     buttonId: "format4kProBtn",
-    statusId: "format4kProSlot1Status",
+    choiceIds: {1: "format4kProSlot1Choice", 2: "format4kProSlot2Choice"},
+    statusIds: {1: "format4kProSlot1Status", 2: "format4kProSlot2Status"},
     busy: false,
     working: false
   }
@@ -2285,70 +2656,150 @@ const formatDevices = {
 
 let formatStatusTimer = null;
 
-function setFormatWorking(device, active) {
-  const statusEl = document.getElementById(device.statusId);
-  const button = document.getElementById(device.buttonId);
-
-  device.working = active;
-
-  if (button) {
-    button.disabled = active;
-  }
-
-  if (!statusEl) {
-    return;
-  }
-
-  statusEl.classList.toggle("sd-work", active);
-
-  if (active) {
-    statusEl.textContent = "WORK...";
-    statusEl.classList.remove("sd-empty", "sd-warning", "sd-full");
-  }
+function getSelectedFormatSlots(device) {
+  return [1, 2].filter(slotId => {
+    const input = document.getElementById(device.choiceIds[slotId]);
+    return input && input.checked;
+  });
 }
 
-async function formatSlot1(deviceKey) {
+function updateFormatButton(deviceKey) {
   const device = formatDevices[deviceKey];
 
   if (!device) {
     return;
   }
 
-  const ok = confirm(`Opravdu FORMÁTOVAT kartu v ${device.label}?\\n\\nIP: ${device.ip}\\nSlot: 1\\nFilesystem: exFAT\\n\\nTato akce smaže obsah karty.`);
+  const button = document.getElementById(device.buttonId);
+
+  if (!button) {
+    return;
+  }
+
+  const slots = getSelectedFormatSlots(device);
+  const media = slots.map(slotId => `${device.mediaLabel} ${slotId}`).join(" + ");
+  button.textContent = media ? `FORMAT ${media}` : "FORMAT – VYBERTE MÉDIUM";
+  button.disabled = device.working || slots.length === 0;
+}
+
+function setFormatSlotAvailability(deviceKey, slotId, available) {
+  const device = formatDevices[deviceKey];
+
+  if (!device || device.working) {
+    return;
+  }
+
+  const input = document.getElementById(device.choiceIds[slotId]);
+
+  if (!input) {
+    return;
+  }
+
+  input.disabled = !available;
+
+  if (!available) {
+    input.checked = false;
+  }
+}
+
+function setFormatWorking(deviceKey, active, selectedSlots=[]) {
+  const device = formatDevices[deviceKey];
+
+  if (!device) {
+    return;
+  }
+
+  device.working = active;
+
+  [1, 2].forEach(slotId => {
+    const input = document.getElementById(device.choiceIds[slotId]);
+
+    if (input) {
+      input.disabled = active;
+    }
+  });
+
+  if (active) {
+    selectedSlots.forEach((slotId, index) => {
+      const statusEl = document.getElementById(device.statusIds[slotId]);
+
+      if (statusEl) {
+        statusEl.textContent = index === 0 ? "WORK..." : "WAIT...";
+        statusEl.classList.add("sd-work");
+        statusEl.classList.remove("sd-empty", "sd-warning", "sd-full");
+      }
+    });
+  }
+
+  updateFormatButton(deviceKey);
+}
+
+async function formatDevice(deviceKey) {
+  const device = formatDevices[deviceKey];
+
+  if (!device) {
+    return;
+  }
+
+  const selectedSlots = getSelectedFormatSlots(device);
+
+  if (!selectedSlots.length) {
+    alert("Vyberte alespoň jedno médium k formátování.");
+    return;
+  }
+
+  const media = selectedSlots.map(slotId => `${device.mediaLabel} ${slotId}`).join(" a ");
+  const sequenceNote = selectedSlots.length > 1 ? "\\nMédia budou formátována postupně." : "";
+  const ok = confirm(`Opravdu FORMÁTOVAT ${media} v ${device.label}?\\n\\nIP: ${device.ip}\\nFilesystem: exFAT${sequenceNote}\\n\\nTato akce nevratně smaže vybraná média.`);
 
   if (!ok) {
     return;
   }
 
-  setFormatWorking(device, true);
+  setFormatWorking(deviceKey, true, selectedSlots);
 
   try {
+    const body = new URLSearchParams();
+    selectedSlots.forEach(slotId => body.append("slot", String(slotId)));
+
     const response = await fetch(device.formatUrl, {
       method: "POST",
-      headers: {"X-CSRF-Token": CSRF_TOKEN},
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-CSRF-Token": CSRF_TOKEN
+      },
+      body: body.toString(),
       cache: "no-store"
     });
     const result = await response.json();
 
-    setFormatWorking(device, false);
+    setFormatWorking(deviceKey, false);
     alert(result.message || (result.ok ? "Formátování hotovo." : "Formátování selhalo."));
-    updateFormatSlot1Status(deviceKey);
+    updateFormatStatuses(deviceKey);
   } catch (err) {
     alert("Formátování selhalo: " + err);
-    setFormatWorking(device, false);
+    setFormatWorking(deviceKey, false);
   }
 }
 
-async function updateFormatSlot1Status(deviceKey) {
-  const device = formatDevices[deviceKey];
+function applyFormatSlotStatus(device, slotId, status) {
+  const el = document.getElementById(device.statusIds[slotId]);
 
-  if (!device) {
+  if (!el) {
     return;
   }
 
-  const el = document.getElementById(device.statusId);
+  el.textContent = status.text || "---";
+  el.classList.remove("sd-work");
+  el.classList.toggle("sd-empty", !!status.empty || el.textContent === "---");
+  el.classList.toggle("sd-warning", !!status.warning);
+  el.classList.toggle("sd-full", !!status.full);
+}
 
-  if (!el || device.busy) {
+async function updateFormatStatuses(deviceKey) {
+  const device = formatDevices[deviceKey];
+
+  if (!device || device.busy) {
     return;
   }
 
@@ -2360,32 +2811,47 @@ async function updateFormatSlot1Status(deviceKey) {
       cache: "no-store"
     });
     const status = await response.json();
+    const progress = status.formatting || {active: false};
 
-    if (device.working) {
-      return;
-    }
+    [1, 2].forEach(slotId => {
+      const slotStatus = status.slots && status.slots[String(slotId)];
 
-    el.textContent = status.text || "---";
-    el.classList.remove("sd-work");
-    el.classList.toggle("sd-empty", !!status.empty || el.textContent === "---");
-    el.classList.toggle("sd-warning", !!status.warning);
-    el.classList.toggle("sd-full", !!status.full);
+      if (device.working && progress.active && progress.slots.includes(slotId)) {
+        const el = document.getElementById(device.statusIds[slotId]);
+
+        if (el && slotId >= progress.current_slot) {
+          el.textContent = slotId === progress.current_slot ? "WORK..." : "WAIT...";
+          el.classList.add("sd-work");
+          el.classList.remove("sd-empty", "sd-warning", "sd-full");
+          return;
+        }
+      }
+
+      if (slotStatus) {
+        applyFormatSlotStatus(device, slotId, slotStatus);
+        setFormatSlotAvailability(deviceKey, slotId, !slotStatus.empty);
+      }
+    });
+
+    updateFormatButton(deviceKey);
   } catch (err) {
     if (device.working) {
       return;
     }
 
-    el.textContent = "---";
-    el.classList.add("sd-empty");
-    el.classList.remove("sd-warning", "sd-full", "sd-work");
+    [1, 2].forEach(slotId => {
+      applyFormatSlotStatus(device, slotId, {text: "---", empty: true});
+      setFormatSlotAvailability(deviceKey, slotId, false);
+    });
+    updateFormatButton(deviceKey);
   } finally {
     device.busy = false;
   }
 }
 
 function updateAllFormatSlotStatuses() {
-  updateFormatSlot1Status("hdMini");
-  updateFormatSlot1Status("format4kPro");
+  updateFormatStatuses("hdMini");
+  updateFormatStatuses("format4kPro");
 }
 
 function startFormatStatusPolling() {
@@ -2789,20 +3255,31 @@ def build_status_api():
     }
 
 
-def build_format_slot_status_payload(nvm_key):
+def build_format_slots_status_payload(nvm_key):
     cfg = load_config()
     advanced_nvm = load_advanced_nvm()
-    text, css_class = get_format_slot_status(
-        advanced_nvm.get(nvm_key, ""),
-        expected_format=cfg.get("expected_format", "1080p50"),
-        slot_id=1
-    )
+    ip = advanced_nvm.get(nvm_key, "")
+    slots = {}
+
+    for slot_id in (1, 2):
+        text, css_class = get_format_slot_status(
+            ip,
+            expected_format=cfg.get("expected_format", "1080p50"),
+            slot_id=slot_id,
+        )
+        slots[str(slot_id)] = {
+            "text": text,
+            "empty": css_class == "sd-empty",
+            "warning": css_class == "sd-warning",
+            "full": css_class == "sd-full",
+        }
+
+    with FORMAT_PROGRESS_LOCK:
+        progress = copy.deepcopy(FORMAT_PROGRESS.get(nvm_key, {"active": False}))
 
     return {
-        "text": text,
-        "empty": css_class == "sd-empty",
-        "warning": css_class == "sd-warning",
-        "full": css_class == "sd-full"
+        "slots": slots,
+        "formatting": progress,
     }
 
 
@@ -3007,13 +3484,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         format_status_paths = {
-            "/api/format-hd-mini-slot1-status": "format_ip_hd_mini",
-            "/api/format-4k-pro-slot1-status": "format_ip_4k_pro"
+            "/api/format-hd-mini-status": "format_ip_hd_mini",
+            "/api/format-4k-pro-status": "format_ip_4k_pro"
         }
 
         if parsed.path in format_status_paths:
             payload = json.dumps(
-                build_format_slot_status_payload(format_status_paths[parsed.path]),
+                build_format_slots_status_payload(format_status_paths[parsed.path]),
                 ensure_ascii=False
             ).encode("utf-8")
 
@@ -3087,13 +3564,30 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         format_action_paths = {
-            "/api/format-hd-mini-slot1": ("format_ip_hd_mini", "HD Mini"),
-            "/api/format-4k-pro-slot1": ("format_ip_4k_pro", "4K Pro")
+            "/api/format-hd-mini": ("format_ip_hd_mini", "HD Mini"),
+            "/api/format-4k-pro": ("format_ip_4k_pro", "4K Pro")
         }
 
         if self.path in format_action_paths:
             nvm_key, device_label = format_action_paths[self.path]
             format_lock = FORMAT_LOCKS[nvm_key]
+            requested_slots = form.get("slot", [])
+            slot_ids = [slot_id for slot_id in (1, 2) if str(slot_id) in requested_slots]
+
+            if not slot_ids or any(slot not in ("1", "2") for slot in requested_slots):
+                payload = json.dumps({
+                    "ok": False,
+                    "message": "Vyberte alespoň jedno médium k formátování.",
+                    "results": [],
+                }, ensure_ascii=False).encode("utf-8")
+
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
 
             if not format_lock.acquire(blocking=False):
                 payload = json.dumps({
@@ -3113,15 +3607,32 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 advanced_nvm = load_advanced_nvm()
                 ip = advanced_nvm.get(nvm_key, "")
-                ok, response = format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT")
+                ok, results = format_hyperdeck_slots(
+                    ip,
+                    slot_ids,
+                    filesystem="exFAT",
+                    progress_key=nvm_key,
+                )
             finally:
+                with FORMAT_PROGRESS_LOCK:
+                    FORMAT_PROGRESS[nvm_key] = {"active": False}
                 format_lock.release()
 
-            message = f"Formátování {device_label} slot 1 hotovo." if ok else f"Formátování {device_label} selhalo: {response}\nNení karta zamčená?"
+            formatted_slots = ", ".join(str(slot_id) for slot_id in slot_ids)
+
+            if ok:
+                message = f"Formátování {device_label}, slot {formatted_slots}, hotovo."
+            else:
+                failed = results[-1] if results else {"slot": "?", "response": "neznámá chyba"}
+                message = (
+                    f"Formátování {device_label}, slot {failed['slot']}, selhalo: "
+                    f"{failed['response']}\nNení karta zamčená?"
+                )
+
             payload = json.dumps({
                 "ok": ok,
                 "message": message,
-                "response": response
+                "results": results,
             }, ensure_ascii=False).encode("utf-8")
 
             self.send_response(200 if ok else 500)

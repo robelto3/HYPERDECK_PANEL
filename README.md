@@ -10,7 +10,7 @@ Panel umožňuje:
 - porovnávat timecode aktivních rekordérů,
 - měnit základní nastavení decků a jejich timecode vstup,
 - zobrazit externí ATEM logger,
-- formátovat slot 1 vybraných HyperDecků.
+- formátovat jeden nebo oba sloty vybraných HyperDecků.
 
 ## Požadavky
 
@@ -112,6 +112,7 @@ nutné obnovit, jinak server její ovládací požadavky odmítne.
 
 ## Varování k formátování
 
-Funkce **FORMAT HD MINI** a **FORMAT 4K Pro** formátují slot 1 jako exFAT a
-nevratně smažou obsah vložené karty. Před potvrzením vždy zkontrolujte vybrané
-zařízení, jeho IP adresu a obsah média.
+Funkce **FORMAT HD MINI** a **FORMAT 4K Pro** formátují vybrané sloty jako
+exFAT a nevratně smažou obsah vložených médií. Pokud jsou vybrané oba sloty,
+formátují se postupně a druhý se při chybě prvního nespustí. Před potvrzením
+vždy zkontrolujte zařízení, jeho IP adresu a vybraná média.

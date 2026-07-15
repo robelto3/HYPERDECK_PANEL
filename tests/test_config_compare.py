@@ -1,5 +1,6 @@
 import copy
 import unittest
+from unittest.mock import patch
 
 import app
 
@@ -36,6 +37,16 @@ class ConfigTests(unittest.TestCase):
         app.normalize_deck_list(cfg)
         cfg["decks"][0]["name"] = "Changed"
         self.assertEqual(app.DEFAULT_CONFIG, original)
+
+    def test_network_interfaces_have_operational_labels(self):
+        with patch.object(app, "get_system_network_interfaces", return_value=[
+            ("eth0", "10.0.0.8"),
+            ("eth1", "10.0.1.8"),
+        ]):
+            output = app.make_network_interfaces_html()
+
+        self.assertIn("eth0 -&gt; Recorders", output)
+        self.assertIn("eth1 -&gt; Atem Logger", output)
 
 
 class TimecodeComparisonTests(unittest.TestCase):
