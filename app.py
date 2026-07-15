@@ -1,4 +1,4 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 import html
@@ -10,6 +10,7 @@ import copy
 import os
 import ipaddress
 import signal
+import secrets
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
@@ -19,6 +20,7 @@ PORT = 8080
 CONFIG_FILE = Path("config.json")
 ADVANCED_NVM_FILE = Path("advanced_nvm.json")
 PANEL_BROWSER_URL = f"http://127.0.0.1:{PORT}/"
+CSRF_TOKEN = secrets.token_urlsafe(32)
 
 DEFAULT_CONFIG = {
     "panel_ip": "10.0.0.8",
@@ -253,6 +255,11 @@ def normalize_sd_state(sd_state):
 
 
 STATUS_LOCK = threading.Lock()
+CONFIG_LOCK = threading.RLock()
+FORMAT_LOCKS = {
+    "format_ip_hd_mini": threading.Lock(),
+    "format_ip_4k_pro": threading.Lock(),
+}
 STATUS_POLLERS = {}
 STATUS_POLLERS_PAUSED = False
 STATUS_CACHE = {}
@@ -717,47 +724,49 @@ def format_is_ok(format_text, expected_format="1080p50"):
 
 
 def save_config(cfg):
-    data = json.dumps(cfg, ensure_ascii=False, indent=2)
-    tmp_file = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    with CONFIG_LOCK:
+        data = json.dumps(cfg, ensure_ascii=False, indent=2)
+        tmp_file = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
 
-    with tmp_file.open("w", encoding="utf-8") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
+        with tmp_file.open("w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
 
-    os.replace(tmp_file, CONFIG_FILE)
+        os.replace(tmp_file, CONFIG_FILE)
 
-    try:
-        dir_fd = os.open(str(CONFIG_FILE.parent), os.O_DIRECTORY)
-    except OSError:
-        return
+        try:
+            dir_fd = os.open(str(CONFIG_FILE.parent), os.O_DIRECTORY)
+        except OSError:
+            return
 
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def save_json_atomic(path, data):
-    serialized = json.dumps(data, ensure_ascii=False, indent=2)
-    tmp_file = path.with_name(path.name + ".tmp")
+    with CONFIG_LOCK:
+        serialized = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp_file = path.with_name(path.name + ".tmp")
 
-    with tmp_file.open("w", encoding="utf-8") as f:
-        f.write(serialized)
-        f.flush()
-        os.fsync(f.fileno())
+        with tmp_file.open("w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
 
-    os.replace(tmp_file, path)
+        os.replace(tmp_file, path)
 
-    try:
-        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-    except OSError:
-        return
+        try:
+            dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+        except OSError:
+            return
 
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def load_advanced_nvm():
@@ -1586,6 +1595,7 @@ def make_rows(cfg):
   <td class="sd"><span class="sd-box {sd2_class_html}" data-role="sd2">{sd2_html}</span></td>
   <td>
     <form class="inline-form" method="POST" action="/action">
+      <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
       <input type="hidden" name="deck" value="{i}">
       <input type="hidden" name="cmd" value="rec">
       <button class="btn rec" type="submit">REC</button>
@@ -1593,6 +1603,7 @@ def make_rows(cfg):
   </td>
   <td>
     <form class="inline-form" method="POST" action="/action">
+      <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
       <input type="hidden" name="deck" value="{i}">
       <input type="hidden" name="cmd" value="stop">
       <button class="btn stop" type="submit">STOP</button>
@@ -2112,11 +2123,13 @@ body.initial-settings .settings-panel {
 
     <div class="bottom">
       <form class="inline-form" method="POST" action="/action">
+        <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
         <input type="hidden" name="cmd" value="rec_all">
         <button class="btn rec big" type="submit">REC ALL</button>
       </form>
 
       <form class="inline-form" method="POST" action="/action">
+        <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
         <input type="hidden" name="cmd" value="stop_all">
         <button class="btn stop big" type="submit">STOP ALL</button>
       </form>
@@ -2130,6 +2143,7 @@ body.initial-settings .settings-panel {
 
   <div id="viewSettings" class="view">
     <form class="settings-form" method="POST" action="/save-settings">
+      <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
       <div class="panel-card">
         <table class="settings-table">
           <thead>
@@ -2151,11 +2165,6 @@ body.initial-settings .settings-panel {
       </div>
 
       <div class="settings-inline-row">
-        <div class="settings-inline-item wide-control">
-          <div class="small-label">FORMÁT</div>
-          <input class="text-input ip-input" type="text" name="expected_format" value="__EXPECTED_FORMAT__">
-        </div>
-
         <div class="settings-inline-item">
           <div class="small-label">TC COMPARE</div>
           <select class="text-input ip-input" name="tc_compare">
@@ -2189,6 +2198,7 @@ body.initial-settings .settings-panel {
 
   <div id="viewAdvanced" class="view">
     <form class="settings-form" method="POST" action="/save-advanced">
+      <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
       <div class="settings-field-row">
         <div class="small-label">ATEM LOGGER IP</div>
         <input class="text-input ip-input" type="text" name="atem_logger_ip" value="__ATEM_LOGGER_IP__">
@@ -2228,10 +2238,13 @@ body.initial-settings .settings-panel {
 
 <script>
 
+const CSRF_TOKEN = "__CSRF_TOKEN__";
+
 async function closePanel() {
   try {
     await fetch("/api/close-panel", {
       method: "POST",
+      headers: {"X-CSRF-Token": CSRF_TOKEN},
       cache: "no-store"
     });
   } catch (err) {
@@ -2312,6 +2325,7 @@ async function formatSlot1(deviceKey) {
   try {
     const response = await fetch(device.formatUrl, {
       method: "POST",
+      headers: {"X-CSRF-Token": CSRF_TOKEN},
       cache: "no-store"
     });
     const result = await response.json();
@@ -2925,11 +2939,6 @@ def build_page(saved=False, initial_view="hyperdeck"):
 
     panel_ip = html.escape(cfg.get("panel_ip", "10.0.0.8"))
     atem_logger_ip = html.escape(cfg.get("atem_logger_ip", "10.0.0.9"))
-    expected_format = html.escape(
-        normalize_format(cfg.get("expected_format", "1080p50")),
-        quote=True
-    )
-
     notice = ""
     if saved:
         notice = '<div class="notice">Nastavení uloženo.</div>'
@@ -2970,13 +2979,13 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__FORMAT_IP_HD_MINI__", html.escape(advanced_nvm.get("format_ip_hd_mini", ""), quote=True))
     page = page.replace("__FORMAT_IP_4K_PRO__", html.escape(advanced_nvm.get("format_ip_4k_pro", ""), quote=True))
     page = page.replace("__NETWORK_INTERFACES__", make_network_interfaces_html())
-    page = page.replace("__EXPECTED_FORMAT__", expected_format)
     page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
     page = page.replace("__TC_COMPARE_YES_SELECTED__", tc_compare_yes_selected)
     page = page.replace("__TC_COMPARE_NO_SELECTED__", tc_compare_no_selected)
     page = page.replace("__TC_TOLERANCE_FRAMES__", tc_tolerance_frames)
     page = page.replace("__STATUS_POLL_ENABLED__", status_poll_enabled)
+    page = page.replace("__CSRF_TOKEN__", html.escape(CSRF_TOKEN, quote=True))
 
     page = apply_real_page_split(page, initial_view)
     return page
@@ -3030,9 +3039,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(page)
 
     def do_POST(self):
+        if self.path in ("/toggle-arm", "/save-advanced", "/save-settings"):
+            with CONFIG_LOCK:
+                return self.handle_POST()
+
+        return self.handle_POST()
+
+    def handle_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = parse_qs(body)
+
+        submitted_token = self.headers.get("X-CSRF-Token", "")
+
+        if not submitted_token:
+            submitted_token = form.get("csrf_token", [""])[0]
+
+        if not secrets.compare_digest(submitted_token, CSRF_TOKEN):
+            if self.path.startswith("/api/"):
+                payload = json.dumps({
+                    "ok": False,
+                    "message": "Neplatný nebo chybějící bezpečnostní token. Obnovte stránku."
+                }, ensure_ascii=False).encode("utf-8")
+
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.send_error(403, "Invalid CSRF token")
+
+            return
 
         if self.path == "/api/close-panel":
             payload = json.dumps({
@@ -3054,9 +3093,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path in format_action_paths:
             nvm_key, device_label = format_action_paths[self.path]
-            advanced_nvm = load_advanced_nvm()
-            ip = advanced_nvm.get(nvm_key, "")
-            ok, response = format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT")
+            format_lock = FORMAT_LOCKS[nvm_key]
+
+            if not format_lock.acquire(blocking=False):
+                payload = json.dumps({
+                    "ok": False,
+                    "message": f"Formátování {device_label} už probíhá.",
+                    "response": "format already in progress"
+                }, ensure_ascii=False).encode("utf-8")
+
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            try:
+                advanced_nvm = load_advanced_nvm()
+                ip = advanced_nvm.get(nvm_key, "")
+                ok, response = format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT")
+            finally:
+                format_lock.release()
+
             message = f"Formátování {device_label} slot 1 hotovo." if ok else f"Formátování {device_label} selhalo: {response}\nNení karta zamčená?"
             payload = json.dumps({
                 "ok": ok,
@@ -3284,6 +3344,21 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-server = HTTPServer((HOST, PORT), Handler)
-print(f"HyperDeck Panel bezi na http://10.0.0.8:{PORT}")
-server.serve_forever()
+class PanelHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+def main():
+    server = PanelHTTPServer((HOST, PORT), Handler)
+    print(f"HyperDeck Panel bezi na http://10.0.0.8:{PORT}")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=hyperdeck
-WorkingDirectory=/home/hyperdeck/hyperdeck_panel
-ExecStart=/home/hyperdeck/hyperdeck_panel/.venv/bin/python /home/hyperdeck/hyperdeck_panel/app.py
+WorkingDirectory=/home/hyperdeck/hyperdeck-panel
+ExecStart=/usr/bin/python3 /home/hyperdeck/hyperdeck-panel/app.py
 Restart=always
 RestartSec=3
 
