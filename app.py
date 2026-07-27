@@ -846,9 +846,9 @@ def get_system_network_interfaces():
 
 def make_network_interfaces_html():
     interfaces = get_system_network_interfaces()
-    interface_labels = {
-        "eth0": "eth0 -> Recorders",
-        "eth1": "eth1 -> Atem Logger",
+    interface_roles = {
+        "eth0": "Recorders",
+        "eth1": "Atem Logger",
     }
 
     if not interfaces:
@@ -857,9 +857,14 @@ def make_network_interfaces_html():
     items = []
 
     for name, ip in interfaces:
-        label = html.escape(interface_labels.get(name, name))
-        value = html.escape(ip)
-        items.append(f'<div class="network-interface"><span>{label}</span> {value}</div>')
+        safe_name = html.escape(name)
+        safe_ip = html.escape(ip)
+        role = interface_roles.get(name)
+        if role:
+            label = f"{safe_name} ({safe_ip}) -&gt; {html.escape(role)}"
+        else:
+            label = f"{safe_name} ({safe_ip})"
+        items.append(f'<div class="network-interface"><span>{label}</span></div>')
 
     return "".join(items)
 
@@ -1782,14 +1787,14 @@ th,td{padding:8px 10px;border-bottom:1px solid #33333d;text-align:center;font-si
 tr:last-child td{border-bottom:none}
 th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;background:#1d1d28}
 /* column layout start */
-.decks-table th:nth-child(1),.decks-table td:nth-child(1){width:12%}
-.decks-table th:nth-child(2),.decks-table td:nth-child(2){width:9%}
-.decks-table th:nth-child(3),.decks-table td:nth-child(3){width:9%}
-.decks-table th:nth-child(4),.decks-table td:nth-child(4){width:10%}
-.decks-table th:nth-child(5),.decks-table td:nth-child(5){width:10%}
-.decks-table th:nth-child(6),.decks-table td:nth-child(6){width:17%}
-.decks-table th:nth-child(7),.decks-table td:nth-child(7){width:12%}
-.decks-table th:nth-child(8),.decks-table td:nth-child(8){width:21%}
+.decks-table th:nth-child(1),.decks-table td:nth-child(1){width:14%}
+.decks-table th:nth-child(2),.decks-table td:nth-child(2){width:11%}
+.decks-table th:nth-child(3),.decks-table td:nth-child(3){width:11%}
+.decks-table th:nth-child(4),.decks-table td:nth-child(4){width:11%}
+.decks-table th:nth-child(5),.decks-table td:nth-child(5){width:11%}
+.decks-table th:nth-child(6),.decks-table td:nth-child(6){width:14%}
+.decks-table th:nth-child(7),.decks-table td:nth-child(7){width:13%}
+.decks-table th:nth-child(8),.decks-table td:nth-child(8){width:15%}
 .settings-table th:nth-child(1),.settings-table td:nth-child(1){width:6%}
 .settings-table th:nth-child(2),.settings-table td:nth-child(2){width:16%}
 .settings-table th:nth-child(3),.settings-table td:nth-child(3){width:16%}
@@ -1866,6 +1871,235 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .disarmed-row .btn{filter:grayscale(1)}
 .bottom{display:flex;justify-content:center;gap:34px;margin-top:18px}
 .big{width:270px;height:66px;font-size:28px;border-radius:14px}
+
+/* main broadcast console start */
+body.hyperdeck-page{
+  background:
+    radial-gradient(circle at 18% -10%,rgba(27,108,255,.22),transparent 34%),
+    radial-gradient(circle at 88% 8%,rgba(120,255,156,.09),transparent 26%),
+    linear-gradient(145deg,#07090e 0%,#0b0d14 48%,#08090d 100%);
+}
+body.hyperdeck-page .wrap{padding:14px 20px 38px}
+.header{
+  position:relative;
+  min-height:72px;
+  margin-bottom:12px;
+  padding:11px 13px 11px 18px;
+  border:1px solid rgba(128,151,190,.24);
+  border-radius:16px;
+  background:linear-gradient(135deg,rgba(27,31,43,.96),rgba(13,15,22,.96));
+  box-shadow:0 18px 42px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.04);
+}
+h1{
+  position:relative;
+  padding-top:17px;
+  color:#f4f7ff;
+  font-size:27px;
+  letter-spacing:2.8px;
+  text-shadow:0 0 20px rgba(93,148,255,.25);
+}
+h1::before{
+  content:"MULTICAM RECORDING";
+  position:absolute;
+  top:0;
+  left:1px;
+  color:#6fa2ff;
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:3.2px;
+  text-shadow:none;
+}
+.active-count{display:none}
+.topnav{margin-left:auto;gap:8px}
+.navbtn{
+  min-height:44px;
+  padding:9px 18px;
+  border-color:rgba(137,153,183,.24);
+  background:rgba(37,42,56,.72);
+  color:#b9c1d0;
+  font-family:Arial,sans-serif;
+  font-size:18px;
+  font-weight:bold;
+  letter-spacing:normal;
+  transition:transform .14s ease,border-color .14s ease,background .14s ease,color .14s ease;
+}
+.navbtn:hover{
+  transform:translateY(-1px);
+  border-color:rgba(116,159,255,.65);
+  background:#293149;
+  color:#fff;
+}
+.navbtn.active{
+  border-color:#6698ff;
+  background:linear-gradient(135deg,#1556d6,#2378ff);
+  color:#fff;
+  box-shadow:0 0 0 1px rgba(102,152,255,.18),0 7px 22px rgba(27,108,255,.32);
+}
+.close-panel-btn{
+  border-color:rgba(255,89,89,.34);
+  border-radius:10px;
+  background:rgba(85,24,29,.62);
+}
+body.hyperdeck-page .alarm{
+  margin-bottom:12px;
+  padding:8px 14px;
+  border:1px solid rgba(255,83,83,.55);
+  border-left:5px solid #ff4141;
+  border-radius:11px;
+  background:linear-gradient(90deg,rgba(133,15,22,.96),rgba(76,8,13,.92));
+  font-size:24px;
+  letter-spacing:.35px;
+  box-shadow:0 8px 26px rgba(255,31,45,.17),inset 0 1px 0 rgba(255,255,255,.08);
+}
+body.hyperdeck-page .alarm-ok{
+  border-color:rgba(76,230,132,.3);
+  border-left-color:#4ce684;
+  background:linear-gradient(90deg,rgba(17,76,43,.96),rgba(10,47,28,.9));
+  box-shadow:0 8px 26px rgba(24,197,91,.13),inset 0 1px 0 rgba(255,255,255,.05);
+}
+body.hyperdeck-page #viewDecks .panel-card{
+  border-color:rgba(129,150,187,.28);
+  border-radius:16px;
+  background:#10131b;
+  box-shadow:0 24px 56px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.035);
+}
+body.hyperdeck-page .decks-table th{
+  height:40px;
+  padding:7px 10px;
+  border-bottom:1px solid rgba(125,148,187,.25);
+  background:linear-gradient(180deg,#1d2230,#171b26);
+  color:#7f8da5;
+  font-size:12px;
+  font-weight:800;
+  letter-spacing:1.7px;
+}
+body.hyperdeck-page .decks-table td{
+  height:62px;
+  padding-top:8px;
+  padding-bottom:8px;
+  border-bottom-color:rgba(113,130,160,.16);
+}
+body.hyperdeck-page .decks-table tbody tr:not(.pgm-row):nth-child(odd) td{background:rgba(15,18,26,.92)}
+body.hyperdeck-page .decks-table tbody tr:not(.pgm-row):nth-child(even) td{background:rgba(21,25,35,.96)}
+body.hyperdeck-page .decks-table tbody tr:not(.pgm-row):hover td{
+  background:#252d3d;
+  box-shadow:inset 0 1px 0 rgba(105,152,255,.14),inset 0 -1px 0 rgba(105,152,255,.14);
+}
+body.hyperdeck-page .name{
+  color:#f4f7fc;
+  font-size:23px;
+  letter-spacing:.25px;
+}
+body.hyperdeck-page .sd-box{
+  width:94%;
+  height:38px;
+  padding:9px 10px 7px;
+  border-radius:8px;
+  background:rgba(7,10,15,.58);
+  box-shadow:inset 0 0 0 1px rgba(135,157,193,.13),0 5px 13px rgba(0,0,0,.13);
+  font-size:22px;
+}
+body.hyperdeck-page .sd-active{
+  background:rgba(45,170,94,.1);
+  box-shadow:inset 0 0 0 1px rgba(92,231,143,.27),inset 0 0 18px rgba(56,216,117,.08);
+}
+body.hyperdeck-page .btn{
+  border:1px solid rgba(255,255,255,.13);
+  border-radius:10px;
+  box-shadow:0 6px 15px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.14);
+  letter-spacing:.6px;
+  transition:transform .12s ease,filter .12s ease,box-shadow .12s ease;
+}
+body.hyperdeck-page .btn:hover{
+  transform:translateY(-1px);
+  filter:brightness(1.13);
+}
+body.hyperdeck-page .btn:active{transform:translateY(1px)}
+body.hyperdeck-page .rec{background:linear-gradient(145deg,#cf1734,#8d071d)}
+body.hyperdeck-page .stop{background:linear-gradient(145deg,#1673ef,#08489f)}
+body.hyperdeck-page .status{
+  padding-left:38px;
+  color:#dce4f1;
+  font-size:17px;
+  letter-spacing:.3px;
+}
+body.hyperdeck-page .led{
+  width:15px;
+  height:15px;
+  margin-right:11px;
+  vertical-align:-1px;
+  border:2px solid rgba(255,255,255,.25);
+}
+body.hyperdeck-page .format{color:#c2cbd9;font-size:18px}
+body.hyperdeck-page .tc{
+  color:#edf4ff;
+  font-size:25px;
+  letter-spacing:1.5px;
+  text-shadow:0 0 15px rgba(109,158,255,.16);
+}
+body.hyperdeck-page .pgm-row td{
+  background:linear-gradient(90deg,rgba(50,48,24,.98),rgba(36,37,25,.98));
+  border-top:2px solid #aaa54d;
+  border-bottom-color:rgba(224,211,90,.22);
+}
+body.hyperdeck-page .decks-table tbody .pgm-row:hover td{
+  background:linear-gradient(90deg,#454326,#343625);
+}
+body.hyperdeck-page .pgm-row .name::after{
+  content:"PGM";
+  display:inline-block;
+  margin-left:9px;
+  padding:3px 6px 2px;
+  border:1px solid rgba(255,224,86,.58);
+  border-radius:5px;
+  background:rgba(255,210,40,.12);
+  color:#ffe76e;
+  font-size:9px;
+  line-height:1;
+  letter-spacing:1px;
+  vertical-align:3px;
+}
+body.hyperdeck-page .bottom{
+  width:max-content;
+  margin:14px auto 0;
+  padding:10px;
+  gap:12px;
+  transform:translateX(-55px);
+  border:1px solid rgba(128,151,190,.22);
+  border-radius:16px;
+  background:rgba(16,19,27,.84);
+  box-shadow:0 14px 34px rgba(0,0,0,.28);
+}
+body.hyperdeck-page .big{
+  width:250px;
+  height:58px;
+  border-radius:11px;
+  font-size:24px;
+}
+body.hyperdeck-page .decks-table .sd-box,
+body.hyperdeck-page .decks-table .btn,
+body.hyperdeck-page .decks-table .status,
+body.hyperdeck-page .decks-table .format{
+  font-family:Arial,sans-serif;
+  font-size:22px;
+  font-weight:bold;
+}
+body.hyperdeck-page .decks-table .tc{font-family:Arial,sans-serif}
+body.hyperdeck-page .decks-table .format{
+  font-family:Arial,sans-serif;
+  font-size:24px;
+  font-weight:normal;
+  letter-spacing:1.2px;
+}
+body.hyperdeck-page .decks-table .sd-box{
+  font-size:23px;
+  font-weight:normal;
+  letter-spacing:1.2px;
+}
+body.hyperdeck-page .decks-table .btn,
+body.hyperdeck-page .decks-table .status{font-size:21px}
+/* main broadcast console end */
+
 .logger-frame{width:100%;height:calc(100vh - 116px);border:1px solid #444;border-radius:12px;background:#000}
 .logger-note{text-align:center;color:#aaa;margin-bottom:8px;font-size:15px}
 .settings-note{margin-top:14px;text-align:center;color:#aaa;font-size:18px}
@@ -2084,7 +2318,6 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 #settings-view h1,
 #settings h1,
 .settings-view h1,
-.settings-page h1,
 .settings-panel h1{
   font-size:20px !important;
   margin:4px 0 6px 0 !important;
@@ -3388,6 +3621,18 @@ def add_initial_settings_class(match):
     return tag[:-1] + ' class="initial-settings settings-page">'
 
 
+def add_hyperdeck_page_class(match):
+    tag = match.group(0)
+
+    if 'class="' in tag:
+        return re.sub(r'class="([^"]*)"', r'class="\1 hyperdeck-page"', tag, count=1)
+
+    if "class='" in tag:
+        return re.sub(r"class='([^']*)'", r"class='\1 hyperdeck-page'", tag, count=1)
+
+    return tag[:-1] + ' class="hyperdeck-page">'
+
+
 def apply_real_page_split(page, initial_view):
     deck_match = re.search(r'\n\s*<div id="viewDecks"[^>]*>', page)
     logger_match = re.search(r'\n\s*<div id="viewLogger"[^>]*>', page)
@@ -3496,6 +3741,13 @@ def build_page(saved=False, initial_view="hyperdeck"):
         page = re.sub(
             r"<body([^>]*)>",
             add_initial_settings_class,
+            page,
+            count=1
+        )
+    elif initial_view == "hyperdeck":
+        page = re.sub(
+            r"<body([^>]*)>",
+            add_hyperdeck_page_class,
             page,
             count=1
         )

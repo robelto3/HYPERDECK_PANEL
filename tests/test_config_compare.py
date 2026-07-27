@@ -45,8 +45,8 @@ class ConfigTests(unittest.TestCase):
         ]):
             output = app.make_network_interfaces_html()
 
-        self.assertIn("eth0 -&gt; Recorders", output)
-        self.assertIn("eth1 -&gt; Atem Logger", output)
+        self.assertIn("eth0 (10.0.0.8) -&gt; Recorders", output)
+        self.assertIn("eth1 (10.0.1.8) -&gt; Atem Logger", output)
 
     def test_format_device_badge_uses_deck_name_for_matching_ip(self):
         cfg = {"decks": [
