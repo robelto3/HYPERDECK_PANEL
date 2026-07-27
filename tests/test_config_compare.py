@@ -48,6 +48,21 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("eth0 -&gt; Recorders", output)
         self.assertIn("eth1 -&gt; Atem Logger", output)
 
+    def test_format_device_badge_uses_deck_name_for_matching_ip(self):
+        cfg = {"decks": [
+            {"name": "Cam 1", "ip": "10.0.0.11"},
+            {"name": "Režie", "ip": "10.0.0.24"},
+        ]}
+        badge = app.make_format_device_deck_badge(cfg, "10.0.0.24")
+        self.assertIn("DECK · Režie", badge)
+        self.assertNotIn("deck-unknown", badge)
+
+    def test_format_device_badge_reports_unknown_and_escapes_name(self):
+        cfg = {"decks": [{"name": "Cam <1>", "ip": "10.0.0.11"}]}
+        badge = app.make_format_device_deck_badge(cfg, "10.0.0.11")
+        self.assertIn("Cam &lt;1&gt;", badge)
+        self.assertIn("deck-unknown", app.make_format_device_deck_badge(cfg, "10.0.0.99"))
+
 
 class TimecodeComparisonTests(unittest.TestCase):
     def setUp(self):

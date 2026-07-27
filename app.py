@@ -966,6 +966,24 @@ def get_active_recorders_html(cfg):
     return f'ACTIVE REC: <span class="active-rec-value">{count}</span>'
 
 
+def make_format_device_deck_badge(cfg, device_ip):
+    device_ip = normalize_ipv4(device_ip, "", allow_empty=True)
+
+    if device_ip:
+        for index, deck in enumerate(cfg.get("decks", [])):
+            deck_ip = normalize_ipv4(deck.get("ip", ""), "", allow_empty=True)
+
+            if deck_ip == device_ip:
+                name = deck.get("name", "").strip() or f"REC {index + 1}"
+                return (
+                    '<div class="format-device-deck-badge">'
+                    f'DECK · {html.escape(name)}'
+                    '</div>'
+                )
+
+    return '<div class="format-device-deck-badge deck-unknown">DECK NENALEZEN</div>'
+
+
 def frames_to_tcx2(total_frames, fps=25):
     total_frames %= 24 * 60 * 60 * fps
 
@@ -1834,9 +1852,15 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .stop:hover{background:#0b6cff}
 .decks-table tbody tr:not(.pgm-row):nth-child(odd) td{background:#111118}
 .decks-table tbody tr:not(.pgm-row):nth-child(even) td{background:#1b1b25}
+.decks-table tbody td{transition:background-color .14s ease}
+.decks-table tbody tr:not(.pgm-row):hover td{background:#292936}
 .settings-table tbody tr:not(.pgm-row):nth-child(odd) td{background:#111118}
 .settings-table tbody tr:not(.pgm-row):nth-child(even) td{background:#1b1b25}
+.settings-table tbody td{transition:background-color .14s ease}
+.settings-table tbody tr:not(.pgm-row):hover td{background:#292936}
 .pgm-row td{background:#202018;border-top:3px solid #777746}
+.decks-table tbody .pgm-row:hover td{background:#303023}
+.settings-table tbody .pgm-row:hover td{background:#303023}
 .pgm-row .name::after{content:""}
 .disarmed-row td{color:#777!important;filter:grayscale(1);opacity:.42}
 .disarmed-row .btn{filter:grayscale(1)}
@@ -2235,6 +2259,33 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
   color:#eee;
   font-size:23px;
 }
+.format-device-heading{
+  display:grid;
+  gap:9px;
+}
+.format-device-deck-badge{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  min-height:38px;
+  padding:7px 12px;
+  border:1px solid #319454;
+  border-radius:8px;
+  background:#123a20;
+  color:#83ffa5;
+  font-size:19px;
+  font-weight:900;
+  letter-spacing:.7px;
+  text-align:center;
+  text-transform:uppercase;
+  box-shadow:0 0 14px rgba(48,190,91,.18);
+}
+.format-device-deck-badge.deck-unknown{
+  border-color:#9a692d;
+  background:#3c2812;
+  color:#ffc66d;
+  box-shadow:0 0 14px rgba(255,174,67,.16);
+}
 .format-device-actions{
   display:grid;
   grid-template-columns:1fr;
@@ -2521,7 +2572,10 @@ body.initial-settings .settings-panel {
 
           <div class="format-device-grid">
             <article class="format-device-card">
-              <h3 class="format-device-name">HyperDeck HD Mini</h3>
+              <div class="format-device-heading">
+                <h3 class="format-device-name">HyperDeck HD Mini</h3>
+                __FORMAT_DECK_HD_MINI__
+              </div>
               <div class="advanced-field">
                 <label for="formatIpHdMini">IP adresa zařízení</label>
                 <input id="formatIpHdMini" class="text-input ip-input" type="text" name="format_ip_hd_mini" value="__FORMAT_IP_HD_MINI__">
@@ -2547,7 +2601,10 @@ body.initial-settings .settings-panel {
             </article>
 
             <article class="format-device-card">
-              <h3 class="format-device-name">HyperDeck 4K Pro</h3>
+              <div class="format-device-heading">
+                <h3 class="format-device-name">HyperDeck 4K Pro</h3>
+                __FORMAT_DECK_4K_PRO__
+              </div>
               <div class="advanced-field">
                 <label for="formatIp4kPro">IP adresa zařízení</label>
                 <input id="formatIp4kPro" class="text-input ip-input" type="text" name="format_ip_4k_pro" value="__FORMAT_IP_4K_PRO__">
@@ -3455,6 +3512,14 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__ATEM_LOGGER_IP__", atem_logger_ip)
     page = page.replace("__FORMAT_IP_HD_MINI__", html.escape(advanced_nvm.get("format_ip_hd_mini", ""), quote=True))
     page = page.replace("__FORMAT_IP_4K_PRO__", html.escape(advanced_nvm.get("format_ip_4k_pro", ""), quote=True))
+    page = page.replace(
+        "__FORMAT_DECK_HD_MINI__",
+        make_format_device_deck_badge(cfg, advanced_nvm.get("format_ip_hd_mini", "")),
+    )
+    page = page.replace(
+        "__FORMAT_DECK_4K_PRO__",
+        make_format_device_deck_badge(cfg, advanced_nvm.get("format_ip_4k_pro", "")),
+    )
     page = page.replace("__NETWORK_INTERFACES__", make_network_interfaces_html())
     page = page.replace("__TC_REF_GROUP_SELECTED__", tc_ref_group_selected)
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
