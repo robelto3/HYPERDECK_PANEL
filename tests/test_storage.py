@@ -12,6 +12,7 @@ class StorageTests(unittest.TestCase):
     def test_resolution_change_scales_remaining_time(self):
         self.assertEqual(app.scale_recording_seconds(400, "1080p50", "2160p50"), 100)
         self.assertEqual(app.scale_recording_seconds(100, "2160p50", "1080p50"), 400)
+        self.assertEqual(app.scale_recording_seconds(100, "1080p50", "1080p25"), 200)
 
     def test_unknown_format_does_not_scale_time(self):
         self.assertEqual(app.scale_recording_seconds(120, "unknown", "1080p50"), 120)

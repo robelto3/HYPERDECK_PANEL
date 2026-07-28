@@ -42,7 +42,7 @@
     {
       "name": "Cam 8",
       "ip": "10.0.0.22",
-      "armed": false
+      "armed": true
     },
     {
       "name": "Cam 9",
@@ -71,5 +71,6 @@
     }
   ],
   "tc_compare": true,
-  "tc_tolerance_frames": 2
+  "tc_tolerance_frames": 2,
+  "format_compare": true
 }

@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "expected_format": "1080p50",
     "tc_reference_mode": "group",
     "tc_compare": True,
+    "format_compare": True,
     "tc_tolerance_frames": 2,
     "decks": [
         {"name": "Cam 1", "ip": "10.0.0.11"},
@@ -52,7 +53,7 @@ DEFAULT_ADVANCED_NVM = {
     "deck_video_formats": []
 }
 
-VIDEO_FORMAT_VALUES = ("1080p50", "2160p50")
+VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "2160p50")
 
 
 def transport_response_to_state(response):
@@ -718,7 +719,10 @@ def get_deck_video_formats(cfg, nvm=None):
     return formats
 
 
-def format_is_ok(format_text, expected_format="1080p50"):
+def format_is_ok(format_text, expected_format="1080p50", compare_enabled=True):
+    if not compare_enabled:
+        return True
+
     expected = normalize_format(expected_format)
     return (format_text or "").strip().lower() == expected
 
@@ -884,6 +888,7 @@ def load_config():
     cfg.setdefault("expected_format", "1080p50")
     cfg.setdefault("tc_reference_mode", "group")
     cfg.setdefault("tc_compare", True)
+    cfg.setdefault("format_compare", True)
     cfg.setdefault("tc_tolerance_frames", 2)
     cfg.setdefault("decks", copy.deepcopy(DEFAULT_CONFIG["decks"]))
     normalize_deck_list(cfg)
@@ -1597,6 +1602,7 @@ def make_alarm(cfg, status_map=None, show_active_recorders=False):
 def make_rows(cfg):
     rows = ""
     deck_video_formats = get_deck_video_formats(cfg)
+    format_compare_enabled = cfg.get("format_compare", True)
 
     status_map = get_status_map(cfg)
     tc_compare = build_tc_compare(cfg, status_map)
@@ -1637,7 +1643,11 @@ def make_rows(cfg):
         elif active_slot == 2:
             sd2_class_html = (sd2_class_html + " sd-active").strip()
         expected_format = deck_video_formats[i]
-        format_class = "format" if format_is_ok(format_text, expected_format) else "format format-warning"
+        format_class = (
+            "format"
+            if format_is_ok(format_text, expected_format, format_compare_enabled)
+            else "format format-warning"
+        )
         tc_warning = tc_compare["by_index"].get(i, {}).get("warning", False)
         tc_class = "tc tc-warning" if tc_warning else "tc"
 
@@ -2116,11 +2126,11 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 .format-btn:hover{background:#5a5a6d;border-color:#8a8aa0}
 .format-btn:disabled{opacity:.55;cursor:wait}
 .format-slot-status{text-align:center}
-.settings-inline-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:36px;width:70%;margin:26px auto 24px auto;box-sizing:border-box}
-.settings-inline-item{display:grid;grid-template-columns:max-content minmax(92px,1fr);align-items:center;justify-content:stretch;gap:8px}
-.settings-inline-item .small-label{margin:0;text-align:left;font-family:Arial,sans-serif;font-size:20px;font-weight:600}
+.settings-inline-row{display:grid;grid-template-columns:repeat(4,max-content);justify-content:space-between;gap:18px;width:70%;margin:26px auto 24px auto;box-sizing:border-box}
+.settings-inline-item{display:grid;grid-template-columns:max-content 118px;align-items:center;justify-content:stretch;gap:8px}
+.settings-inline-item .small-label{margin:0;text-align:right;font-family:Arial,sans-serif;font-size:20px;font-weight:600;white-space:nowrap}
 .settings-inline-item .text-input{font-family:Arial,sans-serif;font-size:20px;font-weight:600;height:34px;padding:4px 6px}
-.settings-inline-item.wide-control{grid-template-columns:max-content minmax(92px,1fr)}
+.settings-inline-item.wide-control{grid-template-columns:max-content 118px}
 .text-input{width:100%;background:#0f0f15;color:#eee;border:1px solid #555;border-radius:8px;padding:10px 12px;font-size:22px}
 .name-input{font-weight:bold}
 .ip-input{font-family:monospace;text-align:center}
@@ -2217,19 +2227,21 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 }
 
 .settings-inline-row{
-  gap:36px !important;
+  grid-template-columns:repeat(4,max-content) !important;
+  justify-content:space-between !important;
+  gap:18px !important;
   width:70% !important;
   margin:22px auto 22px auto !important;
   box-sizing:border-box !important;
 }
 
 .settings-inline-item{
-  grid-template-columns:max-content minmax(92px,1fr) !important;
+  grid-template-columns:max-content 118px !important;
   gap:6px !important;
 }
 
 .settings-inline-item.wide-control{
-  grid-template-columns:max-content minmax(92px,1fr) !important;
+  grid-template-columns:max-content 118px !important;
 }
 
 .settings-inline-item .text-input{
@@ -2779,6 +2791,14 @@ body.initial-settings .settings-panel {
           <div class="small-label">TC TOL. FRAMES</div>
           <input class="text-input ip-input" type="number" min="0" max="50" name="tc_tolerance_frames" value="__TC_TOLERANCE_FRAMES__">
         </div>
+
+        <div class="settings-inline-item">
+          <div class="small-label">V FORMAT COMPARE</div>
+          <select class="text-input ip-input" name="format_compare">
+            <option value="yes" __FORMAT_COMPARE_YES_SELECTED__>Ano</option>
+            <option value="no" __FORMAT_COMPARE_NO_SELECTED__>Ne</option>
+          </select>
+        </div>
       </div>
 
       __NOTICE__
@@ -2897,7 +2917,7 @@ body.initial-settings .settings-panel {
   </div>
 
   <div class="footer">
-    RPi __PANEL_IP__ | ATEM logger __ATEM_LOGGER_IP__ | Tento program napsala Astra, Bobova AI asistentka.
+    Na tomto programu se podíleli Astra (ChatGPT) a Codík (Codex), moji AI asistenti od OpenAI.
   </div>
 </div>
 
@@ -3493,6 +3513,7 @@ if (document.getElementById("hdMiniSlot1Status")) {
 def build_status_api():
     cfg = load_config()
     deck_video_formats = get_deck_video_formats(cfg)
+    format_compare_enabled = cfg.get("format_compare", True)
     decks_out = []
     status_map = get_status_map(cfg)
     tc_compare = build_tc_compare(cfg, status_map)
@@ -3520,7 +3541,11 @@ def build_status_api():
             "status": status_text,
             "led": led_class,
             "format": format_text,
-            "format_ok": format_is_ok(format_text, expected_format),
+            "format_ok": format_is_ok(
+                format_text,
+                expected_format,
+                format_compare_enabled,
+            ),
             "sd1": sd1_text,
             "sd1_empty": sd1_class == "sd-empty",
             "sd1_warning": sd1_class == "sd-warning",
@@ -3724,6 +3749,8 @@ def build_page(saved=False, initial_view="hyperdeck"):
 
     tc_compare_yes_selected = "selected" if cfg.get("tc_compare", True) else ""
     tc_compare_no_selected = "" if cfg.get("tc_compare", True) else "selected"
+    format_compare_yes_selected = "selected" if cfg.get("format_compare", True) else ""
+    format_compare_no_selected = "" if cfg.get("format_compare", True) else "selected"
     tc_tolerance_frames = html.escape(str(cfg.get("tc_tolerance_frames", 2)))
     tc_reference_mode = normalize_tc_reference_mode(cfg.get("tc_reference_mode", "group"))
     tc_ref_group_selected = "selected" if tc_reference_mode == "group" else ""
@@ -3777,6 +3804,8 @@ def build_page(saved=False, initial_view="hyperdeck"):
     page = page.replace("__TC_REF_CONTROL_ROOM_SELECTED__", tc_ref_control_room_selected)
     page = page.replace("__TC_COMPARE_YES_SELECTED__", tc_compare_yes_selected)
     page = page.replace("__TC_COMPARE_NO_SELECTED__", tc_compare_no_selected)
+    page = page.replace("__FORMAT_COMPARE_YES_SELECTED__", format_compare_yes_selected)
+    page = page.replace("__FORMAT_COMPARE_NO_SELECTED__", format_compare_no_selected)
     page = page.replace("__TC_TOLERANCE_FRAMES__", tc_tolerance_frames)
     page = page.replace("__STATUS_POLL_ENABLED__", status_poll_enabled)
     page = page.replace("__CSRF_TOKEN__", html.escape(CSRF_TOKEN, quote=True))
@@ -4093,6 +4122,9 @@ class Handler(BaseHTTPRequestHandler):
 
             tc_compare_value = form.get("tc_compare", ["yes"])[0].strip().lower()
             cfg["tc_compare"] = tc_compare_value not in ("no", "0", "false", "off")
+
+            format_compare_value = form.get("format_compare", ["yes"])[0].strip().lower()
+            cfg["format_compare"] = format_compare_value not in ("no", "0", "false", "off")
 
             try:
                 tolerance = int(form.get(

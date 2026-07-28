@@ -17,8 +17,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(app.normalize_ipv4("::1", "10.0.0.1"), "10.0.0.1")
 
     def test_video_format_choices_are_limited(self):
+        self.assertEqual(app.VIDEO_FORMAT_VALUES, ("1080p25", "1080p50", "2160p50"))
+        self.assertEqual(app.normalize_video_format_choice("1080P25"), "1080p25")
         self.assertEqual(app.normalize_video_format_choice("2160P50"), "2160p50")
         self.assertEqual(app.normalize_video_format_choice("720p50"), "1080p50")
+
+    def test_video_format_comparison_can_be_disabled(self):
+        self.assertFalse(app.format_is_ok("1080p25", "1080p50"))
+        self.assertTrue(app.format_is_ok("1080p25", "1080p50", compare_enabled=False))
 
     def test_missing_decks_are_inserted_before_control_room(self):
         cfg = {"decks": [{"name": "Cam 1", "ip": "10.0.0.11"}, {"name": "Režie", "ip": "10.0.0.24"}]}
