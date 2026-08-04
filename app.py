@@ -1841,10 +1841,13 @@ def make_video_format_select(index, current_value="1080p50"):
 
     for value in VIDEO_FORMAT_VALUES:
         selected = " selected" if value == current_value else ""
-        options.append(f'<option value="{value}"{selected}>{value}</option>')
+        options.append(
+            f'<option class="vf-{value}" value="{value}"{selected}>{value}</option>'
+        )
 
     return (
-        f'<select class="select-input tc-select" name="deck_video_format_{index}">'
+        f'<select class="select-input tc-select video-format-select vf-{current_value}" '
+        f'name="deck_video_format_{index}" onchange="updateVideoFormatColor(this)">'
         + "".join(options)
         + '</select>'
     )
@@ -2675,6 +2678,28 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 }
 /* compact settings end */
 
+/* video format colors start */
+.settings-table .video-format-select.vf-1080p25,
+.settings-table .video-format-select option.vf-1080p25{
+  color:#5bd6ff !important;
+}
+.settings-table .video-format-select.vf-1080p50,
+.settings-table .video-format-select option.vf-1080p50{
+  color:#78ff9c !important;
+}
+.settings-table .video-format-select.vf-2160p50,
+.settings-table .video-format-select option.vf-2160p50{
+  color:#c59bff !important;
+}
+.settings-table .video-format-select{
+  text-shadow:0 0 10px currentColor;
+}
+.settings-table .video-format-select option{
+  background:#0f0f15 !important;
+  text-shadow:none;
+}
+/* video format colors end */
+
 /* advanced layout start */
 #viewAdvanced .settings-form{
   width:min(1180px,94%) !important;
@@ -3234,6 +3259,16 @@ body.initial-settings .settings-panel {
 <script>
 
 const CSRF_TOKEN = "__CSRF_TOKEN__";
+const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-2160p50"];
+
+function updateVideoFormatColor(select) {
+  VIDEO_FORMAT_COLOR_CLASSES.forEach(className => select.classList.remove(className));
+  const selectedClass = `vf-${String(select.value || "").toLowerCase()}`;
+
+  if (VIDEO_FORMAT_COLOR_CLASSES.includes(selectedClass)) {
+    select.classList.add(selectedClass);
+  }
+}
 
 async function closePanel() {
   try {

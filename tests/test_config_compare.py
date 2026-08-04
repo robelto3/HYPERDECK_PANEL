@@ -22,6 +22,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(app.normalize_video_format_choice("2160P50"), "2160p50")
         self.assertEqual(app.normalize_video_format_choice("720p50"), "1080p50")
 
+    def test_video_format_select_has_live_color_class(self):
+        output = app.make_video_format_select(2, "2160p50")
+
+        self.assertIn("video-format-select vf-2160p50", output)
+        self.assertIn('onchange="updateVideoFormatColor(this)"', output)
+        self.assertLess(output.index('<option class="vf-1080p25"'), output.index('<option class="vf-1080p50"'))
+        self.assertLess(output.index('<option class="vf-1080p50"'), output.index('<option class="vf-2160p50"'))
+
     def test_video_format_comparison_can_be_disabled(self):
         self.assertFalse(app.format_is_ok("1080p25", "1080p50"))
         self.assertTrue(app.format_is_ok("1080p25", "1080p50", compare_enabled=False))
