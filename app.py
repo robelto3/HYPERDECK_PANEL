@@ -1,5 +1,5 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from pathlib import Path
 import html
 import json
@@ -270,6 +270,14 @@ STATUS_POLL_INTERVAL = 0.5
 STATUS_CONNECT_TIMEOUT = 1.0
 STATUS_HELLO_TIMEOUT = 0.7
 STATUS_TRANSPORT_TIMEOUT = 0.7
+CONFIG_CONNECT_TIMEOUT = 1.0
+CONFIG_HELLO_TIMEOUT = 0.7
+CONFIG_RESPONSE_TIMEOUT = 0.9
+CONFIG_RETRY_DELAYS = (0.2, 0.4)
+CONFIGURATION_INFO_LOCK = threading.Lock()
+CONFIGURATION_INFO_CACHE = {}
+FORMAT_SLOT_STATUS_LOCK = threading.Lock()
+FORMAT_SLOT_STATUS_CACHE = {}
 
 
 def get_skipped_state():
@@ -1141,20 +1149,69 @@ def send_hyperdeck_command(deck, cmd):
     if not ip or not command:
         return False, "bad command"
 
-    try:
-        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
-            recv_hyperdeck_message(sock, timeout=0.4)
+    expected_statuses = {
+        "rec": {"record", "recording"},
+        "stop": {"stopped", "stop", "preview", "idle"},
+    }[cmd]
+    attempts = len(CONFIG_RETRY_DELAYS) + 1
+    last_message = "deck neodpověděl"
 
-            sock.sendall(b"remote: override: true\r\n")
-            recv_hyperdeck_message(sock, timeout=0.5)
+    for attempt in range(attempts):
+        command_sent = False
 
-            sock.sendall((command + "\r\n").encode("ascii"))
-            response = recv_hyperdeck_message(sock, timeout=1.0)
+        try:
+            with socket.create_connection(
+                (ip, 9993),
+                timeout=CONFIG_CONNECT_TIMEOUT,
+            ) as sock:
+                recv_hyperdeck_message(sock, timeout=CONFIG_HELLO_TIMEOUT)
 
-    except OSError as e:
-        return False, str(e)
+                sock.sendall(b"remote: override: true\r\n")
+                remote_response = receive_hyperdeck_message_type(
+                    sock,
+                    "200 ok",
+                    CONFIG_RESPONSE_TIMEOUT,
+                )
 
-    return "200 ok" in response.lower(), response.strip()
+                if not remote_response:
+                    last_message = "remote override nebyl potvrzen"
+                else:
+                    sock.sendall((command + "\r\n").encode("ascii"))
+                    command_sent = True
+                    command_response = receive_hyperdeck_message_type(
+                        sock,
+                        "200 ok",
+                        CONFIG_RESPONSE_TIMEOUT,
+                    )
+                    last_message = (
+                        command_response.strip()
+                        if command_response
+                        else f"příkaz {command.upper()} nebyl potvrzen"
+                    )
+
+        except OSError as e:
+            last_message = str(e)
+
+        if command_sent:
+            # Potvrzení 200 ok nemusí při opožděných zprávách patřit přímo
+            # příkazu REC/STOP. Rozhodující je proto až čerstvě načtený
+            # transportní stav zařízení.
+            for verify_delay in (0.15, 0.35):
+                time.sleep(verify_delay)
+                actual_status = get_hyperdeck_transport_status(deck)
+
+                if actual_status in expected_statuses:
+                    return True, f"{command.upper()} potvrzeno: {actual_status}"
+
+                if actual_status:
+                    last_message = f"deck zůstal ve stavu {actual_status}"
+                else:
+                    last_message = f"stav po {command.upper()} se nepodařilo ověřit"
+
+        if attempt < len(CONFIG_RETRY_DELAYS):
+            time.sleep(CONFIG_RETRY_DELAYS[attempt])
+
+    return False, last_message
 
 
 def format_hyperdeck_slot(ip, slot_id=1, filesystem="exFAT"):
@@ -1242,36 +1299,180 @@ def format_hyperdeck_slots(ip, slot_ids, filesystem="exFAT", progress_key=None):
     return all(item["ok"] for item in results) and len(results) == len(slot_ids), results
 
 
-def get_format_slot_status(ip, expected_format="1080p50", slot_id=1):
-    ip = normalize_ipv4(ip, "", allow_empty=True)
+def receive_hyperdeck_message_type(sock, response_type, timeout, max_messages=2):
+    response_type = response_type.lower()
+
+    for _ in range(max_messages):
+        response = recv_hyperdeck_message(sock, timeout=timeout)
+
+        if response_type in response.lower():
+            return response
+
+        if not response:
+            break
+
+    return ""
+
+
+def get_hyperdeck_transport_status(deck):
+    ip = deck.get("ip", "").strip()
 
     if not ip:
-        return "---", "sd-empty"
+        return ""
 
-    try:
-        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
-            recv_hyperdeck_message(sock, timeout=0.4)
+    attempts = len(CONFIG_RETRY_DELAYS) + 1
 
-            default_standard = expected_format
-            try:
-                sock.sendall(b"configuration\r\n")
-                configuration_response = recv_hyperdeck_message(sock, timeout=0.7)
-                configuration_info = parse_hyperdeck_info(configuration_response)
-                default_standard = configuration_info.get("default standard", "") or expected_format
-            except OSError:
+    for attempt in range(attempts):
+        try:
+            with socket.create_connection(
+                (ip, 9993),
+                timeout=CONFIG_CONNECT_TIMEOUT,
+            ) as sock:
+                recv_hyperdeck_message(sock, timeout=CONFIG_HELLO_TIMEOUT)
+                sock.sendall(b"transport info\r\n")
+                response = receive_hyperdeck_message_type(
+                    sock,
+                    "208 transport info",
+                    CONFIG_RESPONSE_TIMEOUT,
+                )
+                info = parse_hyperdeck_info(response)
+                status = info.get("status", "").strip().lower()
+
+                if status:
+                    return status
+
+        except OSError:
+            pass
+
+        if attempt < len(CONFIG_RETRY_DELAYS):
+            time.sleep(CONFIG_RETRY_DELAYS[attempt])
+
+    return ""
+
+
+def get_format_slots_status(ip, expected_format="1080p50", slot_ids=(1, 2)):
+    ip = normalize_ipv4(ip, "", allow_empty=True)
+    slot_ids = tuple(dict.fromkeys(
+        int(slot_id)
+        for slot_id in slot_ids
+        if str(slot_id) in ("1", "2")
+    ))
+
+    if not slot_ids:
+        return {}
+
+    if not ip:
+        return {
+            slot_id: {
+                "text": "---",
+                "css_class": "sd-empty",
+                "valid": True,
+                "fresh": True,
+            }
+            for slot_id in slot_ids
+        }
+
+    results = {}
+    unresolved = set(slot_ids)
+    attempts = len(CONFIG_RETRY_DELAYS) + 1
+
+    for attempt in range(attempts):
+        try:
+            with socket.create_connection(
+                (ip, 9993),
+                timeout=CONFIG_CONNECT_TIMEOUT,
+            ) as sock:
+                recv_hyperdeck_message(sock, timeout=CONFIG_HELLO_TIMEOUT)
+
                 default_standard = expected_format
+                sock.sendall(b"configuration\r\n")
+                configuration_response = receive_hyperdeck_message_type(
+                    sock,
+                    "211 configuration",
+                    CONFIG_RESPONSE_TIMEOUT,
+                )
+                configuration_info = parse_hyperdeck_info(configuration_response)
+                default_standard = (
+                    configuration_info.get("default standard", "")
+                    or expected_format
+                )
 
-            sock.sendall(f"slot info: slot id: {slot_id}\r\n".encode("ascii"))
-            slot_response = recv_hyperdeck_message(sock, timeout=1.0)
+                for slot_id in list(unresolved):
+                    sock.sendall(
+                        f"slot info: slot id: {slot_id}\r\n".encode("ascii")
+                    )
+                    slot_response = receive_hyperdeck_message_type(
+                        sock,
+                        "202 slot info",
+                        CONFIG_RESPONSE_TIMEOUT,
+                    )
 
-    except OSError:
-        return "---", "sd-empty"
+                    if not slot_response:
+                        continue
 
-    return slot_response_to_remaining_time(
-        slot_response,
-        default_standard,
-        expected_format
-    )
+                    text, css_class = slot_response_to_remaining_time(
+                        slot_response,
+                        default_standard,
+                        expected_format,
+                    )
+                    results[slot_id] = {
+                        "text": text,
+                        "css_class": css_class,
+                        "valid": True,
+                        "fresh": True,
+                    }
+                    unresolved.discard(slot_id)
+
+        except OSError:
+            pass
+
+        if not unresolved:
+            break
+
+        if attempt < len(CONFIG_RETRY_DELAYS):
+            time.sleep(CONFIG_RETRY_DELAYS[attempt])
+
+    with FORMAT_SLOT_STATUS_LOCK:
+        for slot_id, result in results.items():
+            cache_key = (ip, expected_format, slot_id)
+            FORMAT_SLOT_STATUS_CACHE[cache_key] = (
+                result["text"],
+                result["css_class"],
+            )
+
+        for slot_id in unresolved:
+            cache_key = (ip, expected_format, slot_id)
+            cached = FORMAT_SLOT_STATUS_CACHE.get(cache_key)
+
+            if cached:
+                text, css_class = cached
+                results[slot_id] = {
+                    "text": text,
+                    "css_class": css_class,
+                    "valid": True,
+                    "fresh": False,
+                }
+            else:
+                # Neověřený stav není totéž jako skutečně prázdný slot.
+                # Prohlížeč jej proto nesmí použít k deaktivaci volby média.
+                results[slot_id] = {
+                    "text": "---",
+                    "css_class": "sd-empty",
+                    "valid": False,
+                    "fresh": False,
+                }
+
+    return results
+
+
+def get_format_slot_status(ip, expected_format="1080p50", slot_id=1):
+    result = get_format_slots_status(
+        ip,
+        expected_format=expected_format,
+        slot_ids=(slot_id,),
+    ).get(slot_id, {})
+
+    return result.get("text", "---"), result.get("css_class", "sd-empty")
 
 
 def send_hyperdeck_commands_parallel(decks, cmd):
@@ -1284,12 +1485,12 @@ def send_hyperdeck_commands_parallel(decks, cmd):
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(send_hyperdeck_command, deck, cmd): deck
-            for deck in decks
+            executor.submit(send_hyperdeck_command, deck, cmd): (index, deck)
+            for index, deck in enumerate(decks)
         }
 
         for future in as_completed(future_map):
-            deck = future_map[future]
+            index, deck = future_map[future]
 
             try:
                 ok, response = future.result()
@@ -1297,32 +1498,77 @@ def send_hyperdeck_commands_parallel(decks, cmd):
                 ok, response = False, str(e)
 
             results.append({
+                "index": index,
                 "name": deck.get("name", ""),
                 "ip": deck.get("ip", ""),
                 "ok": ok,
                 "response": response
             })
 
-    return results
+    return sorted(results, key=lambda item: item["index"])
 
 
-def get_hyperdeck_configuration_info(deck):
+def is_hyperdeck_configuration_info(info):
+    configuration_keys = {
+        "timecode input",
+        "video input",
+        "file format",
+        "audio codec",
+        "audio input channels",
+        "default standard",
+    }
+    return any(key in info for key in configuration_keys)
+
+
+def get_hyperdeck_configuration_info(deck, allow_cached_fallback=True):
     ip = deck.get("ip", "").strip()
 
     if not ip:
         return {}
 
-    try:
-        with socket.create_connection((ip, 9993), timeout=0.35) as sock:
-            recv_hyperdeck_message(sock, timeout=0.25)
+    attempts = len(CONFIG_RETRY_DELAYS) + 1
 
-            sock.sendall(b"configuration\r\n")
-            response = recv_hyperdeck_message(sock, timeout=0.7)
+    for attempt in range(attempts):
+        try:
+            with socket.create_connection(
+                (ip, 9993),
+                timeout=CONFIG_CONNECT_TIMEOUT,
+            ) as sock:
+                # Některé modely po ukončení stavového polleru pošlou uvítání
+                # se zpožděním. I prázdné uvítání proto není samo o sobě chyba.
+                recv_hyperdeck_message(sock, timeout=CONFIG_HELLO_TIMEOUT)
+                sock.sendall(b"configuration\r\n")
 
-    except OSError:
-        return {}
+                # Pokud opožděné uvítání dorazí až po příkazu, první přečtená
+                # zpráva bude 500 connection info. Pokračujeme proto až k
+                # vlastní odpovědi 211 configuration.
+                for _ in range(2):
+                    response = recv_hyperdeck_message(
+                        sock,
+                        timeout=CONFIG_RESPONSE_TIMEOUT,
+                    )
+                    info = parse_hyperdeck_info(response)
 
-    return parse_hyperdeck_info(response)
+                    if is_hyperdeck_configuration_info(info):
+                        with CONFIGURATION_INFO_LOCK:
+                            CONFIGURATION_INFO_CACHE[ip] = info.copy()
+                        return info
+
+                    if not response:
+                        break
+
+        except OSError:
+            pass
+
+        if attempt < len(CONFIG_RETRY_DELAYS):
+            time.sleep(CONFIG_RETRY_DELAYS[attempt])
+
+    # Krátký síťový výpadek už nesmaže údaje, které se dříve načetly správně.
+    if allow_cached_fallback:
+        with CONFIGURATION_INFO_LOCK:
+            return CONFIGURATION_INFO_CACHE.get(ip, {}).copy()
+
+    return {}
 
 
 def get_hyperdeck_timecode_input(deck):
@@ -1403,7 +1649,7 @@ def get_configuration_info_map(cfg):
     jobs = []
 
     for i, deck in enumerate(decks):
-        if deck.get("ip", "").strip():
+        if deck_is_armed_at_index(cfg, i, deck) and deck.get("ip", "").strip():
             jobs.append((i, deck))
         else:
             result[i] = {}
@@ -1484,21 +1730,79 @@ def set_hyperdeck_timecode_input(deck, tc_input):
     if not ip:
         return False, "missing ip"
 
-    try:
-        with socket.create_connection((ip, 9993), timeout=1.0) as sock:
-            recv_hyperdeck_message(sock, timeout=0.4)
+    def receive_ok(sock, timeout):
+        last_response = ""
 
-            sock.sendall(b"remote: override: true\r\n")
-            recv_hyperdeck_message(sock, timeout=0.5)
+        # Opožděné 500 connection info může dorazit až po odeslání příkazu.
+        # V tom případě přečteme ještě následující protokolovou zprávu.
+        for _ in range(2):
+            response = recv_hyperdeck_message(sock, timeout=timeout)
+            last_response = response or last_response
 
-            cmd = f"configuration: timecode input: {tc_input}\r\n"
-            sock.sendall(cmd.encode("ascii"))
-            response = recv_hyperdeck_message(sock, timeout=1.0)
+            if "200 ok" in response.lower():
+                return True, response.strip()
 
-    except OSError as e:
-        return False, str(e)
+            if not response:
+                break
 
-    return "200 ok" in response.lower(), response.strip()
+        return False, last_response.strip()
+
+    attempts = len(CONFIG_RETRY_DELAYS) + 1
+    last_message = "deck neodpověděl"
+
+    for attempt in range(attempts):
+        command_accepted = False
+
+        try:
+            with socket.create_connection(
+                (ip, 9993),
+                timeout=CONFIG_CONNECT_TIMEOUT,
+            ) as sock:
+                recv_hyperdeck_message(sock, timeout=CONFIG_HELLO_TIMEOUT)
+
+                sock.sendall(b"remote: override: true\r\n")
+                remote_ok, remote_response = receive_ok(
+                    sock,
+                    CONFIG_RESPONSE_TIMEOUT,
+                )
+
+                if not remote_ok:
+                    last_message = remote_response or "remote override nebyl potvrzen"
+                else:
+                    cmd = f"configuration: timecode input: {tc_input}\r\n"
+                    sock.sendall(cmd.encode("ascii"))
+                    command_accepted, write_response = receive_ok(
+                        sock,
+                        CONFIG_RESPONSE_TIMEOUT,
+                    )
+                    last_message = write_response or "zápis TC IN nebyl potvrzen"
+
+        except OSError as e:
+            last_message = str(e)
+
+        if command_accepted:
+            # Samotné 200 ok nestačí. Zařízení znovu načteme a ověříme, že
+            # skutečně používá požadovanou hodnotu.
+            for verify_delay in (0.15, 0.35):
+                time.sleep(verify_delay)
+                info = get_hyperdeck_configuration_info(
+                    deck,
+                    allow_cached_fallback=False,
+                )
+                actual = info.get("timecode input", "").strip().lower()
+
+                if actual == tc_input:
+                    return True, f"TC IN potvrzeno: {tc_input}"
+
+                if actual:
+                    last_message = f"deck vrátil původní hodnotu {actual}"
+                else:
+                    last_message = "zpětné ověření TC IN se nezdařilo"
+
+        if attempt < len(CONFIG_RETRY_DELAYS):
+            time.sleep(CONFIG_RETRY_DELAYS[attempt])
+
+    return False, last_message
 
 
 def tc_input_label(value):
@@ -1785,6 +2089,11 @@ body.settings-page .advanced-btn{display:inline-block}
 .notice.toast-hide{
   opacity:0;
   transform:translateY(-8px);
+}
+.notice.notice-error{
+  background:#6b1119 !important;
+  color:#fff !important;
+  box-shadow:0 0 14px rgba(255,51,68,.65) !important;
 }
 .alarm{display:none;margin-bottom:10px;padding:10px;border-radius:10px;background:#7a0000;color:#fff;text-align:center;font-size:24px;font-weight:bold;box-shadow:0 0 18px #f33}
 .alarm-ok{background:#113b20;color:#78ff9c;box-shadow:0 0 14px #008d35}
@@ -2705,6 +3014,7 @@ body.initial-settings .settings-panel {
   </div>
 
   __ALARM__
+  __ACTION_NOTICE__
 
   <div id="viewDecks" class="view active">
     <div class="panel-card">
@@ -2947,6 +3257,8 @@ const formatDevices = {
     buttonId: "hdMiniFormatBtn",
     choiceIds: {1: "hdMiniSlot1Choice", 2: "hdMiniSlot2Choice"},
     statusIds: {1: "hdMiniSlot1Status", 2: "hdMiniSlot2Status"},
+    availability: {1: null, 2: null},
+    selectedBeforeUnavailable: {1: true, 2: false},
     busy: false,
     working: false
   },
@@ -2959,6 +3271,8 @@ const formatDevices = {
     buttonId: "format4kProBtn",
     choiceIds: {1: "format4kProSlot1Choice", 2: "format4kProSlot2Choice"},
     statusIds: {1: "format4kProSlot1Status", 2: "format4kProSlot2Status"},
+    availability: {1: null, 2: null},
+    selectedBeforeUnavailable: {1: true, 2: false},
     busy: false,
     working: false
   }
@@ -3005,11 +3319,22 @@ function setFormatSlotAvailability(deviceKey, slotId, available) {
     return;
   }
 
+  const previousAvailability = device.availability[slotId];
   input.disabled = !available;
 
   if (!available) {
+    if (previousAvailability !== false) {
+      device.selectedBeforeUnavailable[slotId] = input.checked;
+    }
     input.checked = false;
+  } else if (
+    previousAvailability === false
+    && device.selectedBeforeUnavailable[slotId]
+  ) {
+    input.checked = true;
   }
+
+  device.availability[slotId] = available;
 }
 
 function setFormatWorking(deviceKey, active, selectedSlots=[]) {
@@ -3025,7 +3350,7 @@ function setFormatWorking(deviceKey, active, selectedSlots=[]) {
     const input = document.getElementById(device.choiceIds[slotId]);
 
     if (input) {
-      input.disabled = active;
+      input.disabled = active || device.availability[slotId] === false;
     }
   });
 
@@ -3137,7 +3462,7 @@ async function updateFormatStatuses(deviceKey) {
         }
       }
 
-      if (slotStatus) {
+      if (slotStatus && slotStatus.valid) {
         applyFormatSlotStatus(device, slotId, slotStatus);
         setFormatSlotAvailability(deviceKey, slotId, !slotStatus.empty);
       }
@@ -3145,15 +3470,9 @@ async function updateFormatStatuses(deviceKey) {
 
     updateFormatButton(deviceKey);
   } catch (err) {
-    if (device.working) {
-      return;
-    }
-
-    [1, 2].forEach(slotId => {
-      applyFormatSlotStatus(device, slotId, {text: "---", empty: true});
-      setFormatSlotAvailability(deviceKey, slotId, false);
-    });
-    updateFormatButton(deviceKey);
+    // Krátký výpadek komunikace nesmí přepsat poslední ověřený stav ani
+    // zrušit výběr média. Další pravidelný dotaz stav znovu ověří.
+    console.log("Format status error:", deviceKey, err);
   } finally {
     device.busy = false;
   }
@@ -3476,21 +3795,31 @@ if (statusPollingAllowedByUrl()) {
     return;
   }
 
+  const hideDelay = notice.classList.contains("notice-error") ? 8000 : 1700;
+
   setTimeout(function() {
     notice.classList.add("toast-hide");
-  }, 1700);
+  }, hideDelay);
 
   setTimeout(function() {
     if (notice.parentNode) {
       notice.parentNode.removeChild(notice);
     }
-  }, 2200);
+  }, hideDelay + 500);
 
   try {
     const url = new URL(window.location.href);
 
-    if (url.searchParams.get("saved") === "1") {
+    if (
+      url.searchParams.get("saved") === "1"
+      || url.searchParams.has("tc_failed")
+      || url.searchParams.has("action_result")
+      || url.searchParams.has("action_failed")
+    ) {
       url.searchParams.delete("saved");
+      url.searchParams.delete("tc_failed");
+      url.searchParams.delete("action_result");
+      url.searchParams.delete("action_failed");
       const newUrl = url.pathname + (url.search ? url.search : "") + url.hash;
       window.history.replaceState({}, "", newUrl);
     }
@@ -3575,18 +3904,23 @@ def build_format_slots_status_payload(nvm_key):
     advanced_nvm = load_advanced_nvm()
     ip = advanced_nvm.get(nvm_key, "")
     slots = {}
+    slot_results = get_format_slots_status(
+        ip,
+        expected_format=cfg.get("expected_format", "1080p50"),
+        slot_ids=(1, 2),
+    )
 
     for slot_id in (1, 2):
-        text, css_class = get_format_slot_status(
-            ip,
-            expected_format=cfg.get("expected_format", "1080p50"),
-            slot_id=slot_id,
-        )
+        result = slot_results.get(slot_id, {})
+        text = result.get("text", "---")
+        css_class = result.get("css_class", "sd-empty")
         slots[str(slot_id)] = {
             "text": text,
             "empty": css_class == "sd-empty",
             "warning": css_class == "sd-warning",
             "full": css_class == "sd-full",
+            "valid": bool(result.get("valid", False)),
+            "fresh": bool(result.get("fresh", False)),
         }
 
     with FORMAT_PROGRESS_LOCK:
@@ -3732,7 +4066,13 @@ def apply_real_page_split(page, initial_view):
 
 
 
-def build_page(saved=False, initial_view="hyperdeck"):
+def build_page(
+    saved=False,
+    initial_view="hyperdeck",
+    tc_failed="",
+    action_result="",
+    action_failed="",
+):
     cfg = load_config()
     advanced_nvm = load_advanced_nvm()
 
@@ -3744,8 +4084,22 @@ def build_page(saved=False, initial_view="hyperdeck"):
     panel_ip = html.escape(cfg.get("panel_ip", "10.0.0.8"))
     atem_logger_ip = html.escape(cfg.get("atem_logger_ip", "10.0.0.9"))
     notice = ""
-    if saved:
+    if tc_failed:
+        notice = (
+            '<div class="notice notice-error">'
+            f'Změnu TC IN se nepodařilo potvrdit: {html.escape(tc_failed)}.'
+            '</div>'
+        )
+    elif saved:
         notice = '<div class="notice">Nastavení uloženo.</div>'
+
+    action_notice = ""
+    if action_result:
+        notice_class = "notice notice-error" if action_failed else "notice"
+        message = html.escape(action_result)
+        if action_failed:
+            message += f" – nepotvrzeno: {html.escape(action_failed)}"
+        action_notice = f'<div class="{notice_class}">{message}</div>'
 
     tc_compare_yes_selected = "selected" if cfg.get("tc_compare", True) else ""
     tc_compare_no_selected = "" if cfg.get("tc_compare", True) else "selected"
@@ -3781,6 +4135,7 @@ def build_page(saved=False, initial_view="hyperdeck"):
     # initial settings body class end
     page = page.replace("__NOTICE__", notice)
     page = page.replace("__ALARM__", make_alarm(cfg, show_active_recorders=(initial_view == "settings")))
+    page = page.replace("__ACTION_NOTICE__", action_notice)
     page = page.replace("__ACTIVE_COUNT__", "")
     if initial_view == "hyperdeck":
         page = page.replace("__ROWS__", make_rows(cfg))
@@ -3848,12 +4203,22 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        saved = "saved=1" in parsed.query
+        query = parse_qs(parsed.query)
+        saved = query.get("saved", [""])[0] == "1"
+        tc_failed = query.get("tc_failed", [""])[0]
+        action_result = query.get("action_result", [""])[0]
+        action_failed = query.get("action_failed", [""])[0]
 
         initial_view = "settings" if (parsed.path == "/settings" or "view=settings" in parsed.query) else ("advanced" if (parsed.path == "/advanced" or "view=advanced" in parsed.query) else ("logger" if (parsed.path == "/atem" or "view=logger" in parsed.query) else "hyperdeck"))
 
 
-        page = build_page(saved=saved, initial_view=initial_view).encode("utf-8")
+        page = build_page(
+            saved=saved,
+            initial_view=initial_view,
+            tc_failed=tc_failed,
+            action_result=action_result,
+            action_failed=action_failed,
+        ).encode("utf-8")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -4014,25 +4379,62 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/action":
             cfg = load_config()
             cmd = form.get("cmd", [""])[0]
+            results = []
+            action_label = ""
 
             if cmd == "rec_all":
-                send_hyperdeck_commands_parallel(get_armed_decks(cfg), "rec")
+                action_label = "REC ALL"
+                results = send_hyperdeck_commands_parallel(
+                    get_armed_decks(cfg),
+                    "rec",
+                )
 
             elif cmd == "stop_all":
-                send_hyperdeck_commands_parallel(get_armed_decks(cfg), "stop")
+                action_label = "STOP ALL"
+                results = send_hyperdeck_commands_parallel(
+                    get_armed_decks(cfg),
+                    "stop",
+                )
 
             elif cmd in ("rec", "stop"):
                 try:
                     deck_index = int(form.get("deck", ["-1"])[0])
 
                     if 0 <= deck_index < len(cfg["decks"]):
-                        send_hyperdeck_command(cfg["decks"][deck_index], cmd)
+                        deck = cfg["decks"][deck_index]
+                        ok, response = send_hyperdeck_command(deck, cmd)
+                        action_label = cmd.upper()
+                        results = [{
+                            "index": deck_index,
+                            "name": deck.get("name", f"REC {deck_index + 1}"),
+                            "ip": deck.get("ip", ""),
+                            "ok": ok,
+                            "response": response,
+                        }]
 
                 except ValueError:
                     pass
 
+            redirect_query = {}
+            if results:
+                successful = sum(1 for result in results if result.get("ok"))
+                total = len(results)
+                failed_names = [
+                    result.get("name", "")
+                    for result in results
+                    if not result.get("ok")
+                ]
+                if failed_names:
+                    redirect_query["action_result"] = (
+                        f"{action_label} potvrzeno: {successful}/{total}"
+                    )
+                    redirect_query["action_failed"] = ", ".join(failed_names)
+
             self.send_response(303)
-            self.send_header("Location", "/")
+            location = "/"
+            if redirect_query:
+                location += "?" + urlencode(redirect_query)
+            self.send_header("Location", location)
             self.end_headers()
             return
 
@@ -4180,6 +4582,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
 
             stop_all_status_pollers(pause_seconds=0.4)
+            tc_failed = []
             for i, deck in enumerate(cfg.get("decks", [])):
                 tc_input = form.get(f"deck_tc_input_{i}", [""])[0].strip().lower()
                 tc_original = form.get(f"deck_tc_original_{i}", ["---"])[0].strip().lower()
@@ -4188,13 +4591,18 @@ class Handler(BaseHTTPRequestHandler):
                     and tc_input in TC_INPUT_VALUES
                     and tc_input != tc_original
                 ):
-                    set_hyperdeck_timecode_input(deck, tc_input)
+                    ok, _message = set_hyperdeck_timecode_input(deck, tc_input)
+                    if not ok:
+                        tc_failed.append(deck.get("name", f"REC {i + 1}"))
 
             save_config(cfg)
             save_advanced_nvm(advanced_nvm)
 
             self.send_response(303)
-            self.send_header("Location", "/settings?saved=1")
+            redirect_query = {"saved": "1"}
+            if tc_failed:
+                redirect_query["tc_failed"] = ", ".join(tc_failed)
+            self.send_header("Location", "/settings?" + urlencode(redirect_query))
             self.end_headers()
             return
 

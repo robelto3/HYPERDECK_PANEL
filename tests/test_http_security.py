@@ -1,6 +1,7 @@
 import io
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import app
 
@@ -107,19 +108,65 @@ class SequentialFormatTests(unittest.TestCase):
         with (
             patch.object(app, "load_config", return_value={"expected_format": "1080p50"}),
             patch.object(app, "load_advanced_nvm", return_value={"format_ip_hd_mini": "10.0.0.24"}),
-            patch.object(app, "get_format_slot_status", side_effect=[
-                ("01h00", ""),
-                ("02h00", ""),
-            ]) as slot_status,
+            patch.object(app, "get_format_slots_status", return_value={
+                1: {"text": "01h00", "css_class": "", "valid": True, "fresh": True},
+                2: {"text": "02h00", "css_class": "", "valid": True, "fresh": True},
+            }) as slot_status,
         ):
             payload = app.build_format_slots_status_payload("format_ip_hd_mini")
 
         self.assertEqual(payload["slots"]["1"]["text"], "01h00")
         self.assertEqual(payload["slots"]["2"]["text"], "02h00")
-        self.assertEqual(
-            [call.kwargs["slot_id"] for call in slot_status.call_args_list],
-            [1, 2],
+        slot_status.assert_called_once_with(
+            "10.0.0.24",
+            expected_format="1080p50",
+            slot_ids=(1, 2),
         )
+
+
+class ActionCommandTests(unittest.TestCase):
+    def test_rec_all_redirect_reports_unconfirmed_deck(self):
+        body = f"csrf_token={app.CSRF_TOKEN}&cmd=rec_all".encode("ascii")
+        handler = make_handler("/action", body=body)
+        cfg = {"decks": [
+            {"name": "Cam 1", "ip": "10.0.0.11", "armed": True},
+            {"name": "Režie", "ip": "10.0.0.24", "armed": True},
+        ]}
+        results = [
+            {"index": 0, "name": "Cam 1", "ip": "10.0.0.11", "ok": False, "response": "failed"},
+            {"index": 1, "name": "Režie", "ip": "10.0.0.24", "ok": True, "response": "confirmed"},
+        ]
+
+        with (
+            patch.object(app, "load_config", return_value=cfg),
+            patch.object(app, "send_hyperdeck_commands_parallel", return_value=results),
+        ):
+            handler.handle_POST()
+
+        self.assertEqual(handler.response_code, 303)
+        location = dict(handler.response_headers)["Location"]
+        query = parse_qs(urlparse(location).query)
+        self.assertEqual(query["action_result"], ["REC ALL potvrzeno: 1/2"])
+        self.assertEqual(query["action_failed"], ["Cam 1"])
+
+    def test_rec_all_success_redirect_has_no_green_confirmation(self):
+        body = f"csrf_token={app.CSRF_TOKEN}&cmd=rec_all".encode("ascii")
+        handler = make_handler("/action", body=body)
+        cfg = {"decks": [
+            {"name": "Režie", "ip": "10.0.0.24", "armed": True},
+        ]}
+        results = [
+            {"index": 0, "name": "Režie", "ip": "10.0.0.24", "ok": True, "response": "confirmed"},
+        ]
+
+        with (
+            patch.object(app, "load_config", return_value=cfg),
+            patch.object(app, "send_hyperdeck_commands_parallel", return_value=results),
+        ):
+            handler.handle_POST()
+
+        self.assertEqual(handler.response_code, 303)
+        self.assertEqual(dict(handler.response_headers)["Location"], "/")
 
 
 if __name__ == "__main__":
