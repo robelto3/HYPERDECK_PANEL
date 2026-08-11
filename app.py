@@ -53,7 +53,7 @@ DEFAULT_ADVANCED_NVM = {
     "deck_video_formats": []
 }
 
-VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "2160p50")
+VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "2160p25", "2160p50")
 
 
 def transport_response_to_state(response):
@@ -87,13 +87,21 @@ def transport_response_to_state(response):
         status_text = status_raw.upper() if status_raw else "ONLINE"
         led_class = "warning"
 
-    is_50fps = "50" in input_format or "50" in video_format
+    display_fps = video_format_display_fps(format_text)
+    is_50fps = display_fps >= 50
     total_frames = tc_text_to_25fps_frames(tc_text, is_50fps=is_50fps)
 
     if total_frames is None:
         return status_text, led_class, format_text, "--:--:--:--", False, 0
 
-    return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
+    return (
+        status_text,
+        led_class,
+        format_text,
+        frames_to_tc(total_frames, display_fps=display_fps),
+        True,
+        total_frames,
+    )
 
 
 def transport_response_to_active_slot(response):
@@ -129,6 +137,18 @@ def format_video_rate(format_text):
         width = int(height * 16 / 9)
 
     return width * height * fps
+
+
+def video_format_display_fps(format_text, fallback=50):
+    match = re.search(
+        r"\d{3,4}[pi](25|50)(?:\D|$)",
+        (format_text or "").lower(),
+    )
+
+    if not match:
+        return fallback
+
+    return int(match.group(1))
 
 
 def scale_recording_seconds(recording_seconds, source_format, target_format):
@@ -310,7 +330,10 @@ def normalize_state_to_snapshot(state, updated_monotonic, snapshot_monotonic):
         status_text,
         led_class,
         format_text,
-        frames_to_tcx2(normalized_frames),
+        frames_to_tc(
+            normalized_frames,
+            display_fps=video_format_display_fps(format_text),
+        ),
         tc_valid,
         normalized_frames
     ) + extra
@@ -1002,7 +1025,7 @@ def make_format_device_deck_badge(cfg, device_ip):
     return '<div class="format-device-deck-badge deck-unknown">DECK NENALEZEN</div>'
 
 
-def frames_to_tcx2(total_frames, fps=25):
+def frames_to_tc(total_frames, display_fps=50, fps=25):
     total_frames %= 24 * 60 * 60 * fps
 
     hh = total_frames // (60 * 60 * fps)
@@ -1012,9 +1035,14 @@ def frames_to_tcx2(total_frames, fps=25):
     total_frames %= 60 * fps
 
     ss = total_frames // fps
-    ff = (total_frames % fps) * 2
+    frame25 = total_frames % fps
+    ff = frame25 * 2 if display_fps >= 50 else frame25
 
     return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+
+def frames_to_tcx2(total_frames, fps=25):
+    return frames_to_tc(total_frames, display_fps=50, fps=fps)
 
 
 def recv_hyperdeck_message(sock, timeout=0.6):
@@ -1127,13 +1155,21 @@ def get_real_state(deck):
         status_text = status_raw.upper() if status_raw else "ONLINE"
         led_class = "warning"
 
-    is_50fps = "50" in input_format or "50" in video_format
+    display_fps = video_format_display_fps(format_text)
+    is_50fps = display_fps >= 50
     total_frames = tc_text_to_25fps_frames(tc_text, is_50fps=is_50fps)
 
     if total_frames is None:
         return status_text, led_class, format_text, "--:--:--:--", False, 0
 
-    return status_text, led_class, format_text, frames_to_tcx2(total_frames), True, total_frames
+    return (
+        status_text,
+        led_class,
+        format_text,
+        frames_to_tc(total_frames, display_fps=display_fps),
+        True,
+        total_frames,
+    )
 
 
 def send_hyperdeck_command(deck, cmd):
@@ -1959,7 +1995,11 @@ def make_rows(cfg):
         tc_class = "tc tc-warning" if tc_warning else "tc"
 
         if tc_valid:
-            tc_cell = f'<td class="{tc_class} live-tc" data-role="tc" data-base-frame="{total_frames}">{tc}</td>'
+            display_fps = video_format_display_fps(format_text)
+            tc_cell = (
+                f'<td class="{tc_class} live-tc" data-role="tc" '
+                f'data-base-frame="{total_frames}" data-display-fps="{display_fps}">{tc}</td>'
+            )
         else:
             tc_cell = f'<td class="{tc_class}" data-role="tc">{tc}</td>'
 
@@ -2687,6 +2727,10 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 .settings-table .video-format-select option.vf-1080p50{
   color:#78ff9c !important;
 }
+.settings-table .video-format-select.vf-2160p25,
+.settings-table .video-format-select option.vf-2160p25{
+  color:#ffd166 !important;
+}
 .settings-table .video-format-select.vf-2160p50,
 .settings-table .video-format-select option.vf-2160p50{
   color:#c59bff !important;
@@ -3259,7 +3303,7 @@ body.initial-settings .settings-panel {
 <script>
 
 const CSRF_TOKEN = "__CSRF_TOKEN__";
-const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-2160p50"];
+const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-2160p25", "vf-2160p50"];
 
 function updateVideoFormatColor(select) {
   VIDEO_FORMAT_COLOR_CLASSES.forEach(className => select.classList.remove(className));
@@ -3607,7 +3651,7 @@ function showView(name) {
   }
 }
 
-function formatTCx2From25Frames(totalFrames) {
+function formatTCFrom25Frames(totalFrames, displayFps = 50) {
   const fps = 25;
   const dayFrames = 24 * 60 * 60 * fps;
 
@@ -3621,11 +3665,11 @@ function formatTCx2From25Frames(totalFrames) {
 
   const seconds = Math.floor(totalFrames / fps);
   const frame25 = totalFrames % fps;
-  const frameX2 = frame25 * 2;
+  const displayFrame = displayFps >= 50 ? frame25 * 2 : frame25;
 
   const pad = (n) => String(n).padStart(2, "0");
 
-  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}:${pad(frameX2)}`;
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}:${pad(displayFrame)}`;
 }
 
 function initLiveTC() {
@@ -3643,10 +3687,11 @@ function updateLiveTC() {
   document.querySelectorAll(".live-tc").forEach((el) => {
     const startMs = Number(el.dataset.startMs || now);
     const startFrame = Number(el.dataset.startFrame || 0);
+    const displayFps = Number(el.dataset.displayFps || 50);
     const elapsedFrames = Math.floor((now - startMs) / 40);
     const currentFrame = startFrame + elapsedFrames;
 
-    el.textContent = formatTCx2From25Frames(currentFrame);
+    el.textContent = formatTCFrom25Frames(currentFrame, displayFps);
   });
 }
 
@@ -3722,6 +3767,7 @@ function applyStatusData(data) {
         tcCell.dataset.baseFrame = String(deck.total_frames);
         tcCell.dataset.startFrame = String(deck.total_frames);
         tcCell.dataset.startMs = String(statusUpdateMs);
+        tcCell.dataset.displayFps = String(deck.tc_display_fps || 50);
         tcCell.textContent = deck.tc;
       } else {
         tcCell.classList.remove("live-tc");
@@ -3729,6 +3775,7 @@ function applyStatusData(data) {
         delete tcCell.dataset.baseFrame;
         delete tcCell.dataset.startFrame;
         delete tcCell.dataset.startMs;
+        delete tcCell.dataset.displayFps;
         tcCell.textContent = deck.tc;
       }
     }
@@ -3922,6 +3969,7 @@ def build_status_api():
             "sd2_active": active_slot == 2,
             "tc": tc,
             "tc_valid": bool(tc_valid),
+            "tc_display_fps": video_format_display_fps(format_text),
             "tc_warning": bool(tc_info.get("warning", False)),
             "tc_diff_frames": int(tc_info.get("diff", 0)),
             "total_frames": int(total_frames),

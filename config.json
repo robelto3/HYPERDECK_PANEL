@@ -71,6 +71,6 @@
     }
   ],
   "tc_compare": true,
-  "tc_tolerance_frames": 2,
+  "tc_tolerance_frames": 1,
   "format_compare": true
 }

@@ -36,6 +36,21 @@ class TimecodeTests(unittest.TestCase):
     def test_frames_are_formatted_as_doubled_timecode(self):
         self.assertEqual(app.frames_to_tcx2(25 + 3), "00:00:01:06")
 
+    def test_frames_are_not_doubled_for_25fps_display(self):
+        self.assertEqual(
+            app.frames_to_tc(25 + 3, display_fps=25),
+            "00:00:01:03",
+        )
+
+    def test_display_fps_is_derived_from_video_format(self):
+        self.assertEqual(app.video_format_display_fps("1080p25"), 25)
+        self.assertEqual(app.video_format_display_fps("2160p25"), 25)
+        self.assertEqual(app.video_format_display_fps("1080p50"), 50)
+        self.assertEqual(app.video_format_display_fps("2160p50"), 50)
+
+    def test_unknown_video_format_keeps_legacy_50fps_display(self):
+        self.assertEqual(app.video_format_display_fps("---"), 50)
+
     def test_timecode_wraps_after_24_hours(self):
         self.assertEqual(app.frames_to_tcx2(24 * 60 * 60 * 25), "00:00:00:00")
 
@@ -70,7 +85,29 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(state[0], "RECORDING")
         self.assertEqual(state[1], "recording")
         self.assertEqual(state[2], "1080p50")
+        self.assertEqual(state[3], "01:02:03:20")
+        self.assertEqual(state[5] % 25, 10)
         self.assertTrue(state[4])
+
+    def test_25fps_transport_response_keeps_frame_number(self):
+        response = (
+            "208 transport info:\r\n"
+            "status: record\r\n"
+            "input video format: 2160p25\r\n"
+            "display timecode: 01:02:03:20\r\n\r\n"
+        )
+        state = app.transport_response_to_state(response)
+        self.assertEqual(state[2], "2160p25")
+        self.assertEqual(state[3], "01:02:03:20")
+        self.assertEqual(state[5] % 25, 20)
+
+    def test_snapshot_normalization_uses_video_format_frame_rate(self):
+        snapshot = app.normalize_state_to_snapshot(
+            ("RECORDING", "recording", "1080p25", "00:00:00:03", True, 3),
+            updated_monotonic=10.0,
+            snapshot_monotonic=11.0,
+        )
+        self.assertEqual(snapshot[3], "00:00:01:03")
 
     def test_no_signal_transport_response(self):
         response = "208 transport info:\r\nstatus: stopped\r\ninput video format: none\r\n\r\n"
