@@ -44,9 +44,10 @@ class TimecodeTests(unittest.TestCase):
 
     def test_display_fps_is_derived_from_video_format(self):
         self.assertEqual(app.video_format_display_fps("1080p25"), 25)
-        self.assertEqual(app.video_format_display_fps("2160p25"), 25)
+        self.assertEqual(app.video_format_display_fps("UHDp25"), 25)
+        self.assertEqual(app.video_format_display_fps("4kp25dci"), 25)
         self.assertEqual(app.video_format_display_fps("1080p50"), 50)
-        self.assertEqual(app.video_format_display_fps("2160p50"), 50)
+        self.assertEqual(app.video_format_display_fps("UHDp50"), 50)
 
     def test_unknown_video_format_keeps_legacy_50fps_display(self):
         self.assertEqual(app.video_format_display_fps("---"), 50)
@@ -89,17 +90,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(state[5] % 25, 10)
         self.assertTrue(state[4])
 
-    def test_25fps_transport_response_keeps_frame_number(self):
-        response = (
-            "208 transport info:\r\n"
-            "status: record\r\n"
-            "input video format: 2160p25\r\n"
-            "display timecode: 01:02:03:20\r\n\r\n"
+    def test_reported_4k_transport_formats_are_named_and_timed_correctly(self):
+        cases = (
+            ("4kp50", "UHDp50", "2160p50", 10),
+            ("4kp25", "UHDp25", "2160p25", 20),
+            ("4kp25dci", "4Kp25", "4kp25", 20),
         )
-        state = app.transport_response_to_state(response)
-        self.assertEqual(state[2], "2160p25")
-        self.assertEqual(state[3], "01:02:03:20")
-        self.assertEqual(state[5] % 25, 20)
+
+        for reported, displayed, expected, internal_frame in cases:
+            with self.subTest(reported=reported):
+                response = (
+                    "208 transport info:\r\n"
+                    "status: record\r\n"
+                    f"input video format: {reported}\r\n"
+                    "display timecode: 01:02:03:20\r\n\r\n"
+                )
+                state = app.transport_response_to_state(response)
+                self.assertEqual(state[2], displayed)
+                self.assertTrue(app.format_is_ok(state[2], expected))
+                self.assertEqual(state[3], "01:02:03:20")
+                self.assertEqual(state[5] % 25, internal_frame)
 
     def test_snapshot_normalization_uses_video_format_frame_rate(self):
         snapshot = app.normalize_state_to_snapshot(

@@ -53,7 +53,35 @@ DEFAULT_ADVANCED_NVM = {
     "deck_video_formats": []
 }
 
-VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "2160p25", "2160p50")
+VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "uhdp25", "uhdp50", "4kp25")
+VIDEO_FORMAT_LABELS = {
+    "1080p25": "1080p25",
+    "1080p50": "1080p50",
+    "uhdp25": "UHDp25",
+    "uhdp50": "UHDp50",
+    "4kp25": "4Kp25",
+}
+VIDEO_FORMAT_CHOICE_ALIASES = {
+    "2160p25": "uhdp25",
+    "2160p50": "uhdp50",
+}
+VIDEO_FORMAT_REPORT_ALIASES = {
+    "2160p25": "uhdp25",
+    "2160p50": "uhdp50",
+    "4kp25": "uhdp25",
+    "4kp50": "uhdp50",
+    "4kp25dci": "4kp25",
+}
+
+
+def normalize_reported_video_format(value):
+    value = (value or "").strip().lower()
+    return VIDEO_FORMAT_REPORT_ALIASES.get(value, value)
+
+
+def video_format_label(value):
+    value = (value or "").strip().lower()
+    return VIDEO_FORMAT_LABELS.get(value, value or "---")
 
 
 def transport_response_to_state(response):
@@ -66,10 +94,14 @@ def transport_response_to_state(response):
     input_format = info.get("input video format", "").lower()
     video_format = info.get("video format", "").lower()
     tc_text = info.get("display timecode") or info.get("timecode") or ""
-    format_text = input_format or video_format or "---"
+    reported_format = input_format or video_format or "---"
 
     if input_format == "none":
-        return "NO SIGNAL", "warning", format_text, "--:--:--:--", False, 0
+        return "NO SIGNAL", "warning", reported_format, "--:--:--:--", False, 0
+
+    format_text = video_format_label(
+        normalize_reported_video_format(reported_format)
+    )
 
     if status_raw in ("record", "recording"):
         status_text = "RECORDING"
@@ -115,7 +147,16 @@ def transport_response_to_active_slot(response):
 
 
 def format_video_rate(format_text):
-    match = re.search(r"(\d{3,4})([pi])(\d+(?:\.\d+)?)", (format_text or "").lower())
+    normalized = (format_text or "").strip().lower()
+    normalized = VIDEO_FORMAT_CHOICE_ALIASES.get(normalized, normalized)
+
+    named_match = re.fullmatch(r"(uhd|4k)p(25|50)", normalized)
+
+    if named_match:
+        width = 3840 if named_match.group(1) == "uhd" else 4096
+        return width * 2160 * float(named_match.group(2))
+
+    match = re.search(r"(\d{3,4})([pi])(\d+(?:\.\d+)?)", normalized)
 
     if not match:
         return None
@@ -141,7 +182,7 @@ def format_video_rate(format_text):
 
 def video_format_display_fps(format_text, fallback=50):
     match = re.search(
-        r"\d{3,4}[pi](25|50)(?:\D|$)",
+        r"(?:\d{3,4}|uhd|4k)[pi](25|50)(?:\D|$)",
         (format_text or "").lower(),
     )
 
@@ -152,8 +193,12 @@ def video_format_display_fps(format_text, fallback=50):
 
 
 def scale_recording_seconds(recording_seconds, source_format, target_format):
-    source_rate = format_video_rate(source_format)
-    target_rate = format_video_rate(target_format)
+    source_rate = format_video_rate(
+        normalize_reported_video_format(source_format)
+    )
+    target_rate = format_video_rate(
+        normalize_video_format_choice(target_format, fallback="")
+    )
 
     if not source_rate or not target_rate:
         return recording_seconds
@@ -715,6 +760,7 @@ def normalize_format(value, fallback="1080p50"):
 
 def normalize_video_format_choice(value, fallback="1080p50"):
     value = normalize_format(value, fallback)
+    value = VIDEO_FORMAT_CHOICE_ALIASES.get(value, value)
 
     if value in VIDEO_FORMAT_VALUES:
         return value
@@ -754,8 +800,9 @@ def format_is_ok(format_text, expected_format="1080p50", compare_enabled=True):
     if not compare_enabled:
         return True
 
-    expected = normalize_format(expected_format)
-    return (format_text or "").strip().lower() == expected
+    actual = normalize_video_format_choice(format_text, fallback="")
+    expected = normalize_video_format_choice(expected_format, fallback="")
+    return bool(actual) and actual == expected
 
 
 
@@ -1134,10 +1181,14 @@ def get_real_state(deck):
     input_format = info.get("input video format", "").lower()
     video_format = info.get("video format", "").lower()
     tc_text = info.get("display timecode") or info.get("timecode") or ""
-    format_text = input_format or video_format or "---"
+    reported_format = input_format or video_format or "---"
 
     if input_format == "none":
-        return "NO SIGNAL", "warning", format_text, "--:--:--:--", False, 0
+        return "NO SIGNAL", "warning", reported_format, "--:--:--:--", False, 0
+
+    format_text = video_format_label(
+        normalize_reported_video_format(reported_format)
+    )
 
     if status_raw in ("record", "recording"):
         status_text = "RECORDING"
@@ -1877,8 +1928,9 @@ def make_video_format_select(index, current_value="1080p50"):
 
     for value in VIDEO_FORMAT_VALUES:
         selected = " selected" if value == current_value else ""
+        label = VIDEO_FORMAT_LABELS[value]
         options.append(
-            f'<option class="vf-{value}" value="{value}"{selected}>{value}</option>'
+            f'<option class="vf-{value}" value="{value}"{selected}>{label}</option>'
         )
 
     return (
@@ -2727,13 +2779,17 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 .settings-table .video-format-select option.vf-1080p50{
   color:#78ff9c !important;
 }
-.settings-table .video-format-select.vf-2160p25,
-.settings-table .video-format-select option.vf-2160p25{
+.settings-table .video-format-select.vf-uhdp25,
+.settings-table .video-format-select option.vf-uhdp25{
   color:#ffd166 !important;
 }
-.settings-table .video-format-select.vf-2160p50,
-.settings-table .video-format-select option.vf-2160p50{
+.settings-table .video-format-select.vf-uhdp50,
+.settings-table .video-format-select option.vf-uhdp50{
   color:#c59bff !important;
+}
+.settings-table .video-format-select.vf-4kp25,
+.settings-table .video-format-select option.vf-4kp25{
+  color:#ff8fb3 !important;
 }
 .settings-table .video-format-select{
   text-shadow:0 0 10px currentColor;
@@ -3096,7 +3152,7 @@ body.initial-settings .settings-panel {
             <th>Rec</th>
             <th>Stop</th>
             <th>Status</th>
-            <th>Format</th>
+            <th>V FORMAT</th>
             <th>TC</th>
           </tr>
         </thead>
@@ -3303,7 +3359,7 @@ body.initial-settings .settings-panel {
 <script>
 
 const CSRF_TOKEN = "__CSRF_TOKEN__";
-const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-2160p25", "vf-2160p50"];
+const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-uhdp25", "vf-uhdp50", "vf-4kp25"];
 
 function updateVideoFormatColor(select) {
   VIDEO_FORMAT_COLOR_CLASSES.forEach(className => select.classList.remove(className));

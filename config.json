@@ -42,7 +42,7 @@
     {
       "name": "Cam 8",
       "ip": "10.0.0.22",
-      "armed": true
+      "armed": false
     },
     {
       "name": "Cam 9",

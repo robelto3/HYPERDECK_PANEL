@@ -10,10 +10,14 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(app.format_recording_time(25 * 3600), "1d 01h")
 
     def test_resolution_change_scales_remaining_time(self):
-        self.assertEqual(app.scale_recording_seconds(400, "1080p50", "2160p50"), 100)
-        self.assertEqual(app.scale_recording_seconds(100, "2160p50", "1080p50"), 400)
+        self.assertEqual(app.scale_recording_seconds(400, "1080p50", "uhdp50"), 100)
+        self.assertEqual(app.scale_recording_seconds(100, "4kp50", "1080p50"), 400)
         self.assertEqual(app.scale_recording_seconds(100, "1080p50", "1080p25"), 200)
-        self.assertEqual(app.scale_recording_seconds(200, "1080p50", "2160p25"), 100)
+        self.assertEqual(app.scale_recording_seconds(200, "1080p50", "uhdp25"), 100)
+
+    def test_uhd_and_dci_widths_are_scaled_independently(self):
+        self.assertEqual(app.scale_recording_seconds(150, "4kp25dci", "uhdp25"), 160)
+        self.assertEqual(app.scale_recording_seconds(150, "4kp25", "4kp25"), 140)
 
     def test_unknown_format_does_not_scale_time(self):
         self.assertEqual(app.scale_recording_seconds(120, "unknown", "1080p50"), 120)
