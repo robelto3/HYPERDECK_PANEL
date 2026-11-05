@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 from pathlib import Path
+import http.client
 import html
 import json
 import socket
@@ -53,10 +54,18 @@ DEFAULT_ADVANCED_NVM = {
     "deck_video_formats": []
 }
 
-VIDEO_FORMAT_VALUES = ("1080p25", "1080p50", "uhdp25", "uhdp50", "4kp25")
+VIDEO_FORMAT_VALUES = (
+    "1080p25",
+    "1080p50",
+    "1080i50",
+    "uhdp25",
+    "uhdp50",
+    "4kp25",
+)
 VIDEO_FORMAT_LABELS = {
     "1080p25": "1080p25",
     "1080p50": "1080p50",
+    "1080i50": "1080i50",
     "uhdp25": "UHDp25",
     "uhdp50": "UHDp50",
     "4kp25": "4Kp25",
@@ -182,14 +191,15 @@ def format_video_rate(format_text):
 
 def video_format_display_fps(format_text, fallback=50):
     match = re.search(
-        r"(?:\d{3,4}|uhd|4k)[pi](25|50)(?:\D|$)",
+        r"(?:\d{3,4}|uhd|4k)([pi])(25|50)(?:\D|$)",
         (format_text or "").lower(),
     )
 
     if not match:
         return fallback
 
-    return int(match.group(1))
+    fps = int(match.group(2))
+    return fps // 2 if match.group(1) == "i" else fps
 
 
 def scale_recording_seconds(recording_seconds, source_format, target_format):
@@ -343,6 +353,17 @@ CONFIGURATION_INFO_LOCK = threading.Lock()
 CONFIGURATION_INFO_CACHE = {}
 FORMAT_SLOT_STATUS_LOCK = threading.Lock()
 FORMAT_SLOT_STATUS_CACHE = {}
+ATEM_LOGGER_STATUS_LOCK = threading.Lock()
+ATEM_LOGGER_FETCH_LOCK = threading.Lock()
+ATEM_LOGGER_STATUS_CACHE = {
+    "ip": "",
+    "updated_monotonic": 0.0,
+    "status": None,
+}
+ATEM_LOGGER_STATUS_CACHE_SECONDS = 0.75
+ATEM_LOGGER_STATUS_TIMEOUT = 0.65
+ATEM_LOGGER_COMMAND_TIMEOUT = 6.5
+ATEM_LOGGER_VIDEO_MODE_TIMEOUT = 10.0
 
 
 def get_skipped_state():
@@ -749,6 +770,477 @@ def normalize_ipv4(value, fallback="", allow_empty=False):
     return str(ip)
 
 
+def make_atem_logger_status(ip="", available=False, error=""):
+    return {
+        "ip": ip,
+        "available": bool(available),
+        "atem_connected": False,
+        "atem_product": "",
+        "atem_video_mode_valid": False,
+        "atem_video_mode": None,
+        "atem_video_format": "",
+        "atem_video_modes_valid": False,
+        "atem_supported_video_modes": 0,
+        "active": False,
+        "state": "offline" if not available else "idle",
+        "fps": None,
+        "generation": 0,
+        "file": "",
+        "last_closed_file": "",
+        "error": str(error or ""),
+    }
+
+
+def normalize_atem_logger_status(payload, ip="", available=True):
+    if not isinstance(payload, dict):
+        return make_atem_logger_status(
+            ip,
+            available=False,
+            error="ATEM Logger vrátil neplatnou odpověď.",
+        )
+
+    active = bool(payload.get("edl_active", False))
+    state = str(payload.get("edl_state", "") or "").strip().lower()
+
+    if state not in ("idle", "starting", "active", "stopping", "error"):
+        state = "active" if active else "idle"
+
+    try:
+        generation = int(payload.get("edl_generation", 0) or 0)
+    except (TypeError, ValueError):
+        generation = 0
+
+    try:
+        fps = int(payload.get("tc_out_fps", 0) or 0)
+    except (TypeError, ValueError):
+        fps = 0
+
+    if fps not in (25, 50):
+        fps = None
+
+    try:
+        atem_video_mode = int(payload.get("atem_video_mode"))
+    except (TypeError, ValueError):
+        atem_video_mode = None
+
+    atem_video_mode_valid = bool(
+        payload.get("atem_video_mode_valid", False)
+        and atem_video_mode is not None
+    )
+    atem_video_format = str(
+        payload.get("atem_video_format", "") or ""
+    ).strip().lower()
+
+    if not atem_video_mode_valid:
+        atem_video_mode = None
+        atem_video_format = ""
+
+    try:
+        atem_supported_video_modes = int(
+            payload.get("atem_supported_video_modes", 0) or 0
+        )
+    except (TypeError, ValueError):
+        atem_supported_video_modes = 0
+
+    return {
+        "ip": ip,
+        "available": bool(available),
+        "atem_connected": bool(payload.get("atem", False)),
+        "atem_product": str(payload.get("atem_product", "") or ""),
+        "atem_video_mode_valid": atem_video_mode_valid,
+        "atem_video_mode": atem_video_mode,
+        "atem_video_format": atem_video_format,
+        "atem_video_modes_valid": bool(
+            payload.get("atem_video_modes_valid", False)
+        ),
+        "atem_supported_video_modes": atem_supported_video_modes,
+        "active": active,
+        "state": state,
+        "fps": fps,
+        "generation": generation,
+        "file": str(payload.get("edl_file", "") or ""),
+        "last_closed_file": str(payload.get("edl_last_closed_file", "") or ""),
+        "error": str(
+            payload.get("edl_error", "")
+            or payload.get("error", "")
+            or ""
+        ),
+    }
+
+
+def atem_logger_http_json(ip, path, method="GET", timeout=ATEM_LOGGER_STATUS_TIMEOUT):
+    connection = None
+
+    try:
+        connection = http.client.HTTPConnection(ip, 80, timeout=timeout)
+        body = b"" if method == "POST" else None
+        connection.request(
+            method,
+            path,
+            body=body,
+            headers={
+                "Accept": "application/json",
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        raw = response.read(16384)
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+
+        if not isinstance(payload, dict):
+            return False, {}, "ATEM Logger vrátil neplatnou odpověď."
+
+        if not (200 <= response.status < 300):
+            error = payload.get("error") or f"HTTP {response.status}"
+            return False, payload, str(error)
+
+        return True, payload, ""
+
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        return False, {}, f"ATEM Logger neodpovídá: {exc}"
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def cache_atem_logger_status(status):
+    with ATEM_LOGGER_STATUS_LOCK:
+        ATEM_LOGGER_STATUS_CACHE["ip"] = status.get("ip", "")
+        ATEM_LOGGER_STATUS_CACHE["updated_monotonic"] = time.monotonic()
+        ATEM_LOGGER_STATUS_CACHE["status"] = copy.deepcopy(status)
+
+
+def preserve_cached_atem_logger_details(status, preserve_connection=False):
+    with ATEM_LOGGER_STATUS_LOCK:
+        cached_status = ATEM_LOGGER_STATUS_CACHE.get("status")
+        cached_ip = ATEM_LOGGER_STATUS_CACHE.get("ip", "")
+
+        if not (
+            isinstance(cached_status, dict)
+            and cached_ip == status.get("ip", "")
+        ):
+            return status
+
+        if status.get("fps") not in (25, 50):
+            status["fps"] = cached_status.get("fps")
+
+        if not status.get("atem_product"):
+            status["atem_product"] = cached_status.get("atem_product", "")
+
+        if not status.get("atem_video_mode_valid"):
+            for key in (
+                "atem_video_mode_valid",
+                "atem_video_mode",
+                "atem_video_format",
+            ):
+                status[key] = cached_status.get(key, status.get(key))
+
+        if not status.get("atem_video_modes_valid"):
+            for key in (
+                "atem_video_modes_valid",
+                "atem_supported_video_modes",
+            ):
+                status[key] = cached_status.get(key, status.get(key))
+
+        if preserve_connection and not status.get("atem_connected"):
+            status["atem_connected"] = bool(
+                cached_status.get("atem_connected", False)
+            )
+
+    return status
+
+
+def get_atem_logger_status(cfg, force=False):
+    ip = normalize_ipv4(
+        cfg.get("atem_logger_ip", "10.0.0.9"),
+        "10.0.0.9",
+    )
+    now = time.monotonic()
+
+    with ATEM_LOGGER_STATUS_LOCK:
+        cached_ip = ATEM_LOGGER_STATUS_CACHE.get("ip", "")
+        cached_at = ATEM_LOGGER_STATUS_CACHE.get("updated_monotonic", 0.0)
+        cached_status = ATEM_LOGGER_STATUS_CACHE.get("status")
+
+        if (
+            not force
+            and cached_status is not None
+            and cached_ip == ip
+            and now - cached_at < ATEM_LOGGER_STATUS_CACHE_SECONDS
+        ):
+            return copy.deepcopy(cached_status)
+
+    with ATEM_LOGGER_FETCH_LOCK:
+        now = time.monotonic()
+
+        with ATEM_LOGGER_STATUS_LOCK:
+            cached_ip = ATEM_LOGGER_STATUS_CACHE.get("ip", "")
+            cached_at = ATEM_LOGGER_STATUS_CACHE.get("updated_monotonic", 0.0)
+            cached_status = ATEM_LOGGER_STATUS_CACHE.get("status")
+
+            if (
+                not force
+                and cached_status is not None
+                and cached_ip == ip
+                and now - cached_at < ATEM_LOGGER_STATUS_CACHE_SECONDS
+            ):
+                return copy.deepcopy(cached_status)
+
+        ok, payload, error = atem_logger_http_json(
+            ip,
+            "/api/state",
+            timeout=ATEM_LOGGER_STATUS_TIMEOUT,
+        )
+
+    if ok:
+        status = normalize_atem_logger_status(payload, ip=ip, available=True)
+    else:
+        status = make_atem_logger_status(ip, available=False, error=error)
+
+    cache_atem_logger_status(status)
+    return copy.deepcopy(status)
+
+
+def set_atem_logger_tc_out_fps(cfg, fps):
+    ip = normalize_ipv4(
+        cfg.get("atem_logger_ip", "10.0.0.9"),
+        "10.0.0.9",
+    )
+
+    if fps not in (25, 50):
+        status = make_atem_logger_status(
+            ip,
+            available=False,
+            error="Neplatná snímková frekvence loggeru.",
+        )
+        cache_atem_logger_status(status)
+        return False, status
+
+    current_status = get_atem_logger_status(cfg, force=True)
+
+    if not current_status.get("available"):
+        if not current_status.get("error"):
+            current_status["error"] = "ATEM Logger neodpovídá."
+        return False, current_status
+
+    if current_status.get("fps") == fps:
+        return True, current_status
+
+    if current_status.get("active"):
+        current_status["error"] = (
+            f"EDL je aktivní; FPS nelze změnit na {fps} před STOP ALL."
+        )
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    connection = None
+    transport_error = ""
+
+    with ATEM_LOGGER_FETCH_LOCK:
+        try:
+            connection = http.client.HTTPConnection(
+                ip,
+                80,
+                timeout=ATEM_LOGGER_COMMAND_TIMEOUT,
+            )
+            connection.request(
+                "GET",
+                f"/save_tc_out_fps?fps={fps}",
+                headers={"Connection": "close"},
+            )
+            response = connection.getresponse()
+            response.read(16384)
+
+            if response.status not in (200, 303):
+                transport_error = f"HTTP {response.status}"
+
+        except (OSError, http.client.HTTPException) as exc:
+            transport_error = str(exc)
+
+        finally:
+            if connection is not None:
+                connection.close()
+
+    status = get_atem_logger_status(cfg, force=True)
+    confirmed = bool(
+        status.get("available")
+        and status.get("fps") == fps
+    )
+
+    if not confirmed:
+        actual_fps = status.get("fps")
+
+        if actual_fps in (25, 50):
+            status["error"] = (
+                f"Logger hlásí {actual_fps} fps místo požadovaných {fps} fps."
+            )
+        elif transport_error:
+            status["error"] = f"Přepnutí loggeru na {fps} fps selhalo: {transport_error}"
+        elif not status.get("error"):
+            status["error"] = f"Logger nepotvrdil {fps} fps."
+
+        cache_atem_logger_status(status)
+
+    return confirmed, copy.deepcopy(status)
+
+
+def set_atem_logger_video_format(cfg, video_format):
+    ip = normalize_ipv4(
+        cfg.get("atem_logger_ip", "10.0.0.9"),
+        "10.0.0.9",
+    )
+    expected_format = normalize_video_format_choice(video_format, fallback="")
+    current_status = get_atem_logger_status(cfg, force=True)
+
+    if not current_status.get("available"):
+        if not current_status.get("error"):
+            current_status["error"] = "ATEM Logger neodpovídá."
+        return False, current_status
+
+    if expected_format == "4kp25":
+        current_status["error"] = (
+            "ATEM Television Studio Pro 4K nepodporuje DCI 4Kp25 "
+            "(4096 × 2160)."
+        )
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    if expected_format not in (
+        "1080i50",
+        "1080p25",
+        "1080p50",
+        "uhdp25",
+        "uhdp50",
+    ):
+        current_status["error"] = "Neplatný výstupní formát ATEMu."
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    if not current_status.get("atem_connected"):
+        current_status["error"] = "ATEM není připojený k loggeru."
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    if not current_status.get("atem_video_mode_valid"):
+        current_status["error"] = "ATEM nepotvrdil aktuální výstupní formát."
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    if current_status.get("atem_video_format") == expected_format:
+        return True, current_status
+
+    if current_status.get("active"):
+        current_status["error"] = (
+            "EDL je aktivní; výstupní formát ATEMu nelze změnit před STOP ALL."
+        )
+        cache_atem_logger_status(current_status)
+        return False, current_status
+
+    with ATEM_LOGGER_FETCH_LOCK:
+        ok, payload, error = atem_logger_http_json(
+            ip,
+            "/api/atem/video-mode?" + urlencode({"format": expected_format}),
+            method="POST",
+            timeout=ATEM_LOGGER_VIDEO_MODE_TIMEOUT,
+        )
+
+    if payload:
+        status = normalize_atem_logger_status(payload, ip=ip, available=True)
+        preserve_cached_atem_logger_details(status)
+    else:
+        status = make_atem_logger_status(ip, available=False, error=error)
+
+    confirmed = bool(
+        ok
+        and payload.get("ok") is True
+        and status.get("atem_connected")
+        and status.get("atem_video_mode_valid")
+        and status.get("atem_video_format") == expected_format
+    )
+
+    if not confirmed:
+        actual_format = status.get("atem_video_format")
+        if error == "edl_active":
+            status["error"] = (
+                "EDL je aktivní; výstupní formát ATEMu nelze změnit před STOP ALL."
+            )
+        elif actual_format:
+            status["error"] = (
+                f"ATEM hlásí {video_format_label(actual_format)} místo "
+                f"{video_format_label(expected_format)}."
+            )
+        elif error:
+            status["error"] = (
+                f"Přepnutí ATEMu na {video_format_label(expected_format)} "
+                f"selhalo: {error}"
+            )
+        elif not status.get("error"):
+            status["error"] = (
+                f"ATEM nepotvrdil {video_format_label(expected_format)}."
+            )
+
+    cache_atem_logger_status(status)
+    return confirmed, copy.deepcopy(status)
+
+
+def request_atem_logger_edl(cfg, command):
+    ip = normalize_ipv4(
+        cfg.get("atem_logger_ip", "10.0.0.9"),
+        "10.0.0.9",
+    )
+
+    if command not in ("start", "stop"):
+        status = make_atem_logger_status(
+            ip,
+            available=False,
+            error="Neplatný EDL příkaz.",
+        )
+        cache_atem_logger_status(status)
+        return False, status
+
+    with ATEM_LOGGER_FETCH_LOCK:
+        ok, payload, error = atem_logger_http_json(
+            ip,
+            f"/api/edl/{command}",
+            method="POST",
+            timeout=ATEM_LOGGER_COMMAND_TIMEOUT,
+        )
+
+    if payload:
+        status = normalize_atem_logger_status(payload, ip=ip, available=True)
+        preserve_cached_atem_logger_details(
+            status,
+            preserve_connection="atem" not in payload,
+        )
+    else:
+        status = make_atem_logger_status(ip, available=False, error=error)
+
+    if error and not status.get("error"):
+        status["error"] = error
+
+    if command == "start":
+        confirmed = bool(
+            ok
+            and payload.get("ok") is True
+            and status.get("active")
+            and status.get("file")
+        )
+        if not confirmed and not status.get("error"):
+            status["error"] = "Vytvoření EDL nebylo potvrzeno."
+    else:
+        confirmed = bool(
+            ok
+            and payload.get("ok") is True
+            and not status.get("active")
+        )
+        if not confirmed and not status.get("error"):
+            status["error"] = "Uzavření EDL nebylo potvrzeno."
+
+    cache_atem_logger_status(status)
+    return confirmed, copy.deepcopy(status)
+
+
 def normalize_format(value, fallback="1080p50"):
     value = (value or "").strip()
 
@@ -794,6 +1286,105 @@ def get_deck_video_formats(cfg, nvm=None):
         formats.append(normalize_video_format_choice(value, fallback))
 
     return formats
+
+
+def get_control_room_expected_fps(cfg, nvm=None):
+    control_room_format = get_control_room_expected_format(cfg, nvm=nvm)
+    return video_format_display_fps(control_room_format, fallback=50)
+
+
+def get_control_room_expected_format(cfg, nvm=None):
+    decks = cfg.get("decks", [])
+
+    if not decks:
+        return "1080p50"
+
+    formats = get_deck_video_formats(cfg, nvm=nvm)
+    return formats[len(decks) - 1]
+
+
+def synchronize_atem_video_format(cfg, nvm=None):
+    expected_format = get_control_room_expected_format(cfg, nvm=nvm)
+    ok, status = set_atem_logger_video_format(cfg, expected_format)
+    status["expected_atem_video_format"] = expected_format
+    status["atem_format_matches"] = bool(
+        status.get("available")
+        and status.get("atem_connected")
+        and status.get("atem_video_mode_valid")
+        and status.get("atem_video_format") == expected_format
+    )
+    return ok, status, expected_format
+
+
+def synchronize_atem_logger_fps(cfg, nvm=None):
+    expected_fps = get_control_room_expected_fps(cfg, nvm=nvm)
+    ok, status = set_atem_logger_tc_out_fps(cfg, expected_fps)
+    status["expected_fps"] = expected_fps
+    status["fps_matches"] = bool(
+        status.get("available")
+        and status.get("fps") == expected_fps
+    )
+    return ok, status, expected_fps
+
+
+def start_atem_logger_edl(cfg):
+    format_ok, status, _expected_format = synchronize_atem_video_format(cfg)
+
+    if not format_ok:
+        return False, status
+
+    fps_ok, status, _expected_fps = synchronize_atem_logger_fps(cfg)
+
+    if not fps_ok:
+        return False, status
+
+    return request_atem_logger_edl(cfg, "start")
+
+
+def build_atem_logger_panel_status(cfg):
+    status = get_atem_logger_status(cfg)
+    expected_format = get_control_room_expected_format(cfg)
+    expected_fps = get_control_room_expected_fps(cfg)
+    actual_format = status.get("atem_video_format")
+    actual_fps = status.get("fps")
+    format_matches = bool(
+        status.get("available")
+        and status.get("atem_connected")
+        and status.get("atem_video_mode_valid")
+        and actual_format == expected_format
+    )
+    fps_matches = bool(
+        status.get("available")
+        and actual_fps == expected_fps
+    )
+    status["expected_atem_video_format"] = expected_format
+    status["atem_format_matches"] = format_matches
+    status["expected_fps"] = expected_fps
+    status["fps_matches"] = fps_matches
+
+    if status.get("available") and not format_matches and not status.get("error"):
+        if expected_format == "4kp25":
+            status["error"] = "ATEM nepodporuje DCI 4Kp25."
+        elif not status.get("atem_connected"):
+            status["error"] = "ATEM není připojený k loggeru."
+        elif actual_format:
+            status["error"] = (
+                f"ATEM má {video_format_label(actual_format)}, Režie vyžaduje "
+                f"{video_format_label(expected_format)}."
+            )
+        else:
+            status["error"] = (
+                f"ATEM nepotvrdil {video_format_label(expected_format)}."
+            )
+    elif status.get("available") and not fps_matches and not status.get("error"):
+        if actual_fps in (25, 50):
+            status["error"] = (
+                f"Logger má {actual_fps} fps, Režie vyžaduje {expected_fps} fps."
+            )
+        else:
+            status["error"] = f"Logger nepotvrdil {expected_fps} fps."
+
+    return status
 
 
 def format_is_ok(format_text, expected_format="1080p50", compare_enabled=True):
@@ -2285,6 +2876,12 @@ th{color:#a8a8b5;font-size:14px;text-transform:uppercase;letter-spacing:1px;back
 .disarmed-row .btn{filter:grayscale(1)}
 .bottom{display:flex;justify-content:center;gap:34px;margin-top:18px}
 .big{width:270px;height:66px;font-size:28px;border-radius:14px}
+.edl-status{display:flex;align-items:center;justify-content:center;gap:10px;width:534px;min-height:38px;margin:8px auto 0;padding:7px 14px;border:1px solid #555;border-radius:10px;background:#17171f;color:#bbb;font-size:17px;font-weight:bold;letter-spacing:.35px;box-shadow:0 7px 20px rgba(0,0,0,.2)}
+.edl-status-label{font-size:12px;letter-spacing:1.8px;opacity:.78}
+.edl-status.edl-active{border-color:rgba(76,230,132,.48);background:rgba(17,76,43,.72);color:#78ff9c;box-shadow:0 0 16px rgba(24,197,91,.18)}
+.edl-status.edl-idle{border-color:rgba(150,160,178,.26);background:rgba(35,38,47,.78);color:#bcc4d2}
+.edl-status.edl-working{border-color:rgba(255,210,74,.5);background:rgba(95,72,9,.68);color:#ffe071;box-shadow:0 0 16px rgba(255,210,74,.16)}
+.edl-status.edl-error{border-color:rgba(255,83,83,.64);background:rgba(116,13,21,.88);color:#fff;box-shadow:0 0 17px rgba(255,51,68,.24)}
 
 /* main broadcast console start */
 body.hyperdeck-page{
@@ -2779,6 +3376,10 @@ body.hyperdeck-page .decks-table .status{font-size:21px}
 .settings-table .video-format-select option.vf-1080p50{
   color:#78ff9c !important;
 }
+.settings-table .video-format-select.vf-1080i50,
+.settings-table .video-format-select option.vf-1080i50{
+  color:#49e6d8 !important;
+}
 .settings-table .video-format-select.vf-uhdp25,
 .settings-table .video-format-select option.vf-uhdp25{
   color:#ffd166 !important;
@@ -3163,17 +3764,21 @@ body.initial-settings .settings-panel {
     </div>
 
     <div class="bottom">
-      <form class="inline-form" method="POST" action="/action">
+      <form class="inline-form group-action-form" method="POST" action="/action" onsubmit="return beginGroupAction('start')">
         <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
         <input type="hidden" name="cmd" value="rec_all">
-        <button class="btn rec big" type="submit">REC ALL</button>
+        <button class="btn rec big" data-group-action type="submit">REC ALL</button>
       </form>
 
-      <form class="inline-form" method="POST" action="/action">
+      <form class="inline-form group-action-form" method="POST" action="/action" onsubmit="return beginGroupAction('stop')">
         <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
         <input type="hidden" name="cmd" value="stop_all">
-        <button class="btn stop big" type="submit">STOP ALL</button>
+        <button class="btn stop big" data-group-action type="submit">STOP ALL</button>
       </form>
+    </div>
+    <div id="edlStatus" class="edl-status edl-working" aria-live="polite">
+      <span class="edl-status-label">EDL</span>
+      <span data-role="edl-text">NAČÍTÁM STAV LOGGERU…</span>
     </div>
   </div>
 
@@ -3359,7 +3964,7 @@ body.initial-settings .settings-panel {
 <script>
 
 const CSRF_TOKEN = "__CSRF_TOKEN__";
-const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-uhdp25", "vf-uhdp50", "vf-4kp25"];
+const VIDEO_FORMAT_COLOR_CLASSES = ["vf-1080p25", "vf-1080p50", "vf-1080i50", "vf-uhdp25", "vf-uhdp50", "vf-4kp25"];
 
 function updateVideoFormatColor(select) {
   VIDEO_FORMAT_COLOR_CLASSES.forEach(className => select.classList.remove(className));
@@ -3757,8 +4362,74 @@ setInterval(updateLiveTC, 40);
 const STATUS_POLL_ENABLED = __STATUS_POLL_ENABLED__;
 let statusFetchBusy = false;
 
+function setEdlStatus(cssClass, text) {
+  const status = document.getElementById("edlStatus");
+
+  if (!status) {
+    return;
+  }
+
+  status.classList.remove("edl-active", "edl-idle", "edl-working", "edl-error");
+  status.classList.add(cssClass);
+
+  const textNode = status.querySelector('[data-role="edl-text"]');
+  if (textNode) {
+    textNode.textContent = text;
+  }
+}
+
+function applyEdlStatus(edl) {
+  if (!edl || !edl.available) {
+    const error = edl && edl.error ? ` · ${edl.error}` : "";
+    setEdlStatus("edl-error", `NEPOTVRZENO${error}`);
+    return;
+  }
+
+  const fpsText = (edl.fps === 25 || edl.fps === 50) ? `${edl.fps} FPS · ` : "";
+
+  if (edl.state === "starting") {
+    setEdlStatus("edl-working", "ZAKLÁDÁM SOUBOR…");
+    return;
+  }
+
+  if (edl.state === "stopping") {
+    setEdlStatus("edl-working", "UZAVÍRÁM SOUBOR…");
+    return;
+  }
+
+  if (edl.state === "error" || edl.error) {
+    setEdlStatus("edl-error", `NEPOTVRZENO · ${edl.error || "LOGGER HLÁSÍ CHYBU"}`);
+    return;
+  }
+
+  if (edl.active && edl.file) {
+    setEdlStatus("edl-active", `${fpsText}AKTIVNÍ · ${edl.file}`);
+    return;
+  }
+
+  if (edl.last_closed_file) {
+    setEdlStatus("edl-idle", `${fpsText}UZAVŘENO · ${edl.last_closed_file}`);
+    return;
+  }
+
+  setEdlStatus("edl-idle", `${fpsText}PŘIPRAVEN · ŽÁDNÝ AKTIVNÍ SOUBOR`);
+}
+
+function beginGroupAction(action) {
+  document.querySelectorAll("[data-group-action]").forEach((button) => {
+    button.disabled = true;
+  });
+  setEdlStatus(
+    "edl-working",
+    action === "start" ? "ZAKLÁDÁM SOUBOR…" : "ČEKÁM NA POTVRZENÍ STOP…"
+  );
+  return true;
+}
+
 function applyStatusData(data) {
   const statusUpdateMs = Date.now();
+
+  applyEdlStatus(data.edl);
 
   if (data.alarm_html) {
     const alarm = document.getElementById("tcAlarm");
@@ -3951,11 +4622,15 @@ if (statusPollingAllowedByUrl()) {
     if (
       url.searchParams.get("saved") === "1"
       || url.searchParams.has("tc_failed")
+      || url.searchParams.has("logger_fps_failed")
+      || url.searchParams.has("atem_format_failed")
       || url.searchParams.has("action_result")
       || url.searchParams.has("action_failed")
     ) {
       url.searchParams.delete("saved");
       url.searchParams.delete("tc_failed");
+      url.searchParams.delete("logger_fps_failed");
+      url.searchParams.delete("atem_format_failed");
       url.searchParams.delete("action_result");
       url.searchParams.delete("action_failed");
       const newUrl = url.pathname + (url.search ? url.search : "") + url.hash;
@@ -4034,6 +4709,7 @@ def build_status_api():
 
     return {
         "alarm_html": make_alarm(cfg, status_map=status_map),
+        "edl": build_atem_logger_panel_status(cfg),
         "decks": decks_out
     }
 
@@ -4209,6 +4885,8 @@ def build_page(
     saved=False,
     initial_view="hyperdeck",
     tc_failed="",
+    logger_fps_failed="",
+    atem_format_failed="",
     action_result="",
     action_failed="",
 ):
@@ -4223,11 +4901,27 @@ def build_page(
     panel_ip = html.escape(cfg.get("panel_ip", "10.0.0.8"))
     atem_logger_ip = html.escape(cfg.get("atem_logger_ip", "10.0.0.9"))
     notice = ""
+    settings_failures = []
     if tc_failed:
+        settings_failures.append(
+            f"Změnu TC IN se nepodařilo potvrdit: {html.escape(tc_failed)}."
+        )
+    if logger_fps_failed:
+        settings_failures.append(
+            "Nastavení bylo uloženo, ale synchronizace FPS loggeru selhala: "
+            f"{html.escape(logger_fps_failed)}."
+        )
+    if atem_format_failed:
+        settings_failures.append(
+            "Nastavení bylo uloženo, ale synchronizace výstupu ATEMu selhala: "
+            f"{html.escape(atem_format_failed)}."
+        )
+
+    if settings_failures:
         notice = (
             '<div class="notice notice-error">'
-            f'Změnu TC IN se nepodařilo potvrdit: {html.escape(tc_failed)}.'
-            '</div>'
+            + " ".join(settings_failures)
+            + '</div>'
         )
     elif saved:
         notice = '<div class="notice">Nastavení uloženo.</div>'
@@ -4345,6 +5039,8 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         saved = query.get("saved", [""])[0] == "1"
         tc_failed = query.get("tc_failed", [""])[0]
+        logger_fps_failed = query.get("logger_fps_failed", [""])[0]
+        atem_format_failed = query.get("atem_format_failed", [""])[0]
         action_result = query.get("action_result", [""])[0]
         action_failed = query.get("action_failed", [""])[0]
 
@@ -4355,6 +5051,8 @@ class Handler(BaseHTTPRequestHandler):
             saved=saved,
             initial_view=initial_view,
             tc_failed=tc_failed,
+            logger_fps_failed=logger_fps_failed,
+            atem_format_failed=atem_format_failed,
             action_result=action_result,
             action_failed=action_failed,
         ).encode("utf-8")
@@ -4520,20 +5218,52 @@ class Handler(BaseHTTPRequestHandler):
             cmd = form.get("cmd", [""])[0]
             results = []
             action_label = ""
+            edl_failure = ""
 
             if cmd == "rec_all":
                 action_label = "REC ALL"
-                results = send_hyperdeck_commands_parallel(
-                    get_armed_decks(cfg),
-                    "rec",
-                )
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    deck_future = executor.submit(
+                        send_hyperdeck_commands_parallel,
+                        get_armed_decks(cfg),
+                        "rec",
+                    )
+                    edl_future = executor.submit(
+                        start_atem_logger_edl,
+                        cfg,
+                    )
+                    results = deck_future.result()
+                    edl_ok, edl_status = edl_future.result()
+
+                if not edl_ok:
+                    edl_failure = (
+                        "EDL: "
+                        + (edl_status.get("error") or "vytvoření nebylo potvrzeno")
+                    )
 
             elif cmd == "stop_all":
                 action_label = "STOP ALL"
+                armed_decks = get_armed_decks(cfg)
                 results = send_hyperdeck_commands_parallel(
-                    get_armed_decks(cfg),
+                    armed_decks,
                     "stop",
                 )
+
+                all_stopped = bool(results) and (
+                    len(results) == len(armed_decks)
+                    and all(result.get("ok") for result in results)
+                )
+
+                if all_stopped:
+                    edl_ok, edl_status = request_atem_logger_edl(cfg, "stop")
+
+                    if not edl_ok:
+                        edl_failure = (
+                            "EDL: "
+                            + (edl_status.get("error") or "uzavření nebylo potvrzeno")
+                        )
+                else:
+                    edl_failure = "EDL zůstal aktivní"
 
             elif cmd in ("rec", "stop"):
                 try:
@@ -4563,6 +5293,8 @@ class Handler(BaseHTTPRequestHandler):
                     for result in results
                     if not result.get("ok")
                 ]
+                if edl_failure:
+                    failed_names.append(edl_failure)
                 if failed_names:
                     redirect_query["action_result"] = (
                         f"{action_label} potvrzeno: {successful}/{total}"
@@ -4736,11 +5468,27 @@ class Handler(BaseHTTPRequestHandler):
 
             save_config(cfg)
             save_advanced_nvm(advanced_nvm)
+            atem_format_ok, atem_status, expected_atem_format = (
+                synchronize_atem_video_format(cfg, nvm=advanced_nvm)
+            )
+            logger_fps_ok, logger_status, expected_logger_fps = (
+                synchronize_atem_logger_fps(cfg, nvm=advanced_nvm)
+            )
 
             self.send_response(303)
             redirect_query = {"saved": "1"}
             if tc_failed:
                 redirect_query["tc_failed"] = ", ".join(tc_failed)
+            if not logger_fps_ok:
+                logger_error = logger_status.get("error") or "bez potvrzení"
+                redirect_query["logger_fps_failed"] = (
+                    f"{expected_logger_fps} fps – {logger_error}"
+                )
+            if not atem_format_ok:
+                atem_error = atem_status.get("error") or "bez potvrzení"
+                redirect_query["atem_format_failed"] = (
+                    f"{video_format_label(expected_atem_format)} – {atem_error}"
+                )
             self.send_header("Location", "/settings?" + urlencode(redirect_query))
             self.end_headers()
             return

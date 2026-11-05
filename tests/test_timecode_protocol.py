@@ -48,6 +48,7 @@ class TimecodeTests(unittest.TestCase):
         self.assertEqual(app.video_format_display_fps("4kp25dci"), 25)
         self.assertEqual(app.video_format_display_fps("1080p50"), 50)
         self.assertEqual(app.video_format_display_fps("UHDp50"), 50)
+        self.assertEqual(app.video_format_display_fps("1080i50"), 25)
 
     def test_unknown_video_format_keeps_legacy_50fps_display(self):
         self.assertEqual(app.video_format_display_fps("---"), 50)
@@ -88,6 +89,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(state[2], "1080p50")
         self.assertEqual(state[3], "01:02:03:20")
         self.assertEqual(state[5] % 25, 10)
+        self.assertTrue(state[4])
+
+    def test_interlaced_transport_uses_25fps_timecode(self):
+        response = (
+            "208 transport info:\r\n"
+            "status: record\r\n"
+            "input video format: 1080i50\r\n"
+            "display timecode: 01:02:03:20\r\n\r\n"
+        )
+        state = app.transport_response_to_state(response)
+        self.assertEqual(state[2], "1080i50")
+        self.assertEqual(state[3], "01:02:03:20")
+        self.assertEqual(state[5] % 25, 20)
         self.assertTrue(state[4])
 
     def test_reported_4k_transport_formats_are_named_and_timed_correctly(self):

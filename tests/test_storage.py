@@ -14,6 +14,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(app.scale_recording_seconds(100, "4kp50", "1080p50"), 400)
         self.assertEqual(app.scale_recording_seconds(100, "1080p50", "1080p25"), 200)
         self.assertEqual(app.scale_recording_seconds(200, "1080p50", "uhdp25"), 100)
+        self.assertEqual(app.scale_recording_seconds(100, "1080i50", "1080p25"), 100)
 
     def test_uhd_and_dci_widths_are_scaled_independently(self):
         self.assertEqual(app.scale_recording_seconds(150, "4kp25dci", "uhdp25"), 160)

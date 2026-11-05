@@ -19,9 +19,10 @@ class ConfigTests(unittest.TestCase):
     def test_video_format_choices_are_limited(self):
         self.assertEqual(
             app.VIDEO_FORMAT_VALUES,
-            ("1080p25", "1080p50", "uhdp25", "uhdp50", "4kp25"),
+            ("1080p25", "1080p50", "1080i50", "uhdp25", "uhdp50", "4kp25"),
         )
         self.assertEqual(app.normalize_video_format_choice("1080P25"), "1080p25")
+        self.assertEqual(app.normalize_video_format_choice("1080I50"), "1080i50")
         self.assertEqual(app.normalize_video_format_choice("UHDp25"), "uhdp25")
         self.assertEqual(app.normalize_video_format_choice("4Kp25"), "4kp25")
         self.assertEqual(app.normalize_video_format_choice("2160P25"), "uhdp25")
@@ -33,11 +34,13 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIn("video-format-select vf-uhdp50", output)
         self.assertIn('value="uhdp50" selected>UHDp50</option>', output)
+        self.assertIn('value="1080i50">1080i50</option>', output)
         self.assertIn('value="4kp25">4Kp25</option>', output)
         self.assertNotIn('value="2160p50"', output)
         self.assertIn('onchange="updateVideoFormatColor(this)"', output)
         self.assertLess(output.index('<option class="vf-1080p25"'), output.index('<option class="vf-1080p50"'))
-        self.assertLess(output.index('<option class="vf-1080p50"'), output.index('<option class="vf-uhdp25"'))
+        self.assertLess(output.index('<option class="vf-1080p50"'), output.index('<option class="vf-1080i50"'))
+        self.assertLess(output.index('<option class="vf-1080i50"'), output.index('<option class="vf-uhdp25"'))
         self.assertLess(output.index('<option class="vf-uhdp25"'), output.index('<option class="vf-uhdp50"'))
         self.assertLess(output.index('<option class="vf-uhdp50"'), output.index('<option class="vf-4kp25"'))
 
